@@ -1,6 +1,6 @@
 ---
 name: cdc-pipeline-debug
-description: Flink CDC 管道排障。用户说数据对不上/丢数据/延迟高/起不来/加字段/改类型/DDL/主从切换/binlog 时触发。只说数据有问题也应触发。基于官网文档。
+description: Flink CDC 管道排障手册。当用户说「数据对不上」「丢数据」「延迟高」「起不来」「加字段」「改类型」「DDL」「主从切换」「binlog」「挂了」「断了」「迁移」「扩容」「改密码」时**立刻触发**。即使用户只说「数据有问题」「帮我看看」「验证数据」而上下文是实时数仓/ETL，也**应当触发**。基于 Flink CDC 官方文档，描述现象即可排查。
 version: 1.0.0
 author: open-anolis
 os_support:
