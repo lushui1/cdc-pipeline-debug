@@ -39,14 +39,14 @@ contributor_type: personal
 
 Flink CDC 与 Flink 版本不匹配是启动报错头号原因。先确认：
 
-| CDC 版本 | 兼容 Flink 版本 |
-|----------|----------------|
+| CDC 版本 | 兼容 Flink |
+|----------|-----------|
 | 3.6.* | 1.20.*, 2.2.* |
 | 3.5.* | 1.19.*, 1.20.* |
 | 3.3.* | 1.18.* ~ 2.1.* |
 | 3.0.* | 1.14.* ~ 1.18.* |
-| 2.4.* | 1.13.* ~ 1.17.* |
-| 2.4.* | 1.13.* ~ 1.17.* |
+
+完整版本表见 `references/version-matrix.md`。【官网 §概述 → Supported Flink Versions】
 
 【官网 §概述 → Supported Flink Versions】
 
