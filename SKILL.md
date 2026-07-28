@@ -1,6 +1,6 @@
 ---
 name: cdc-pipeline-debug
-description: 诊断修复 CDC 管道数据一致性问题。当用户说「数据对不上」「丢数据」「对不齐」「同步慢」「延迟高」「起不来」「报错了」「挂了」「断了」「连不上」「超时」「重启」「恢复」「加字段」「删字段」「改类型」「DDL」「迁移」「扩容」「升级」「降级」「改密码」「主从切换」「缺数据」「没数据」「binlog」「怎么配」「第一次搭」或上下文涉及数据同步/ETL/实时数仓/Canal/Debezium/DataX/DTS/DMS 时**立刻触发**。即使用户只说「数据有问题」「同步停了」「帮我看看」「数据对吗」「对个账」而上下文是数据管道/ETL/实时数仓，也**应该触发**。覆盖 Flink CDC/Canal/Debezium/DataX/DTS 等工具。基于 Flink CDC 官方文档，描述现象即可用。
+description: Flink CDC 管道排障。用户说数据对不上/丢数据/延迟高/起不来/加字段/改类型/DDL/主从切换/binlog 时触发。只说数据有问题也应触发。基于官网文档。
 version: 1.0.0
 author: open-anolis
 os_support:
@@ -42,8 +42,10 @@ Flink CDC 与 Flink 版本不匹配是启动报错头号原因。先确认：
 | CDC 版本 | 兼容 Flink 版本 |
 |----------|----------------|
 | 3.6.* | 1.20.*, 2.2.* |
+| 3.5.* | 1.19.*, 1.20.* |
 | 3.3.* | 1.18.* ~ 2.1.* |
 | 3.0.* | 1.14.* ~ 1.18.* |
+| 2.4.* | 1.13.* ~ 1.17.* |
 | 2.4.* | 1.13.* ~ 1.17.* |
 
 【官网 §概述 → Supported Flink Versions】
@@ -184,7 +186,7 @@ Flink WebUI 查看背压：
 
 | 场景 | 原因 | 操作 |
 |------|------|------|
-| 源表加字段，目标库没有 | Flink SQL 模式不支持自动 DDL | 手动改 DDL，从 savepoint 重启。或切换到 CDC YAML 模式并开启 schema-change.enabled。 |
+| 源表加字段，目标库没有 | Flink SQL 模式不支持自动 DDL | 手动改 DDL，从 savepoint 重启。或切换到 CDC YAML 模式并开启 schema-change.enabled（实验特性）。 |
 | 字段改名 | 映射为先删后加，数据丢失 | 不要自动同步改名，手动处理。 |
 | 字段类型缩窄（VARCHAR 200→100） | 写入失败 | 先停 CDC，改目标表结构，再恢复。 |
 | gh-ost/pt-osc 在线 DDL 后异常 | 影子表交换 | 开启 scan.parse.online.schema.changes.enabled=true（实验性）。【官网 §MySQL CDC → 连接器选项】 |
