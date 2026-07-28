@@ -1,6 +1,6 @@
 ---
 name: cdc-pipeline-debug
-description: 诊断与修复 CDC 增量同步/实时数据管道中的数据一致性问题。当用户说"数据对不上""增量同步少了""CDC丢数据""数据值回退""精度丢失""时区偏差""任务启动失败""运行中断""恢复失败""OOM""延迟堆积""加字段未同步""改类型写入失败""主从切换异常""binlog""server-id""GTID""Sequence Column""数据类型映射""复制槽""WAL""LogMiner""checkpoint超时""schema evolution""heartbeat""增量快照""chunk key""debezium"时**立刻触发**。即使用户只说"实时数据不准""业务库和数仓对不上""flink任务起来就挂""数据恢复不了"而上下文是数据管道/ETL/实时数仓，也**应该触发**。基于 Apache Flink CDC 官方文档构建。不依赖用户具体架构，描述现象即可用。
+description: 诊断与修复 CDC 增量同步/实时数据管道中的数据一致性问题。当用户说"数据对不上""增量同步少了""数据是旧的""日志正常但数据不对""启动就报错""起不来""精度不对""小数位多了""时间错了""时间差""差几个小时""延迟越来越高""延迟堆积""加了字段目标库没有""加字段未同步""改类型写入失败""丢数据""数据值回退""运行中断""恢复失败""OOM""主从切换异常""binlog""server-id""GTID""Sequence Column""数据类型映射""复制槽""WAL""LogMiner""checkpoint超时""schema evolution""heartbeat""增量快照""chunk key""debezium""快照太慢"时**立刻触发**。即使用户只说"实时数据不准""业务库和数仓对不上""flink任务起来就挂""数据恢复不了""binlog找不到""CDC任务停了"而上下文是数据管道/ETL/实时数仓，也**应该触发**。基于 Apache Flink CDC 官方文档构建。不依赖用户具体架构，描述现象即可用。
 version: 1.0.0
 author: open-anolis
 os_support:
