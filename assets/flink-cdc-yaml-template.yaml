@@ -1,0 +1,50 @@
+# Flink CDC YAML 整库同步配置模板（MySQL → Doris）
+# 用法：替换尖括号 <> 内的值为实际参数
+# 对应技能章节：二、执行流程 → 8. 特定工具问题
+
+source:
+  type: mysql
+  hostname: <mysql_host>
+  port: 3306
+  username: <cdc_user>
+  password: "<password>"
+
+  # 库表匹配 —— 支持正则
+  tables: <database>.\\.*
+
+  # 排除不需要同步的表
+  tables.exclude: <database>.tmp_.*, <database>._.*_bak
+
+  # server-id 范围 = 并行度 + 余量（必须 ≥ parallelism）
+  server-id: 5501-5508
+
+  # 心跳（默认30s，不要禁用）
+  heartbeat.interval: 30s
+
+  # 启动模式
+  scan.startup.mode: initial
+
+  # 增量快照参数
+  scan.incremental.snapshot.chunk.size: 8096
+
+sink:
+  type: doris
+  fenodes: <doris_fe_host>:8030
+  username: root
+  password: "<password>"
+  # 目标库表名前缀
+  table.create.properties.light_schema_change: true
+  sink.label-prefix: ${pipeline.name}
+  sink.properties.format: json
+  sink.properties.read_json_by_line: true
+
+route:
+  # 自动映射：source.table → ods.ods_table
+  - source-table: <database>.\\.*
+    sink-table: ods.ods_<>
+
+pipeline:
+  name: <pipeline_name>
+  parallelism: 4
+  # checkpoint
+  execution.checkpointing.interval: 30s
