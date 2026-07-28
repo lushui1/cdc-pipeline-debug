@@ -1,7 +1,7 @@
 ---
 name: cdc-pipeline-debug
-description: 诊断与修复 CDC 增量同步/实时数据管道中的数据一致性问题。当用户说"数据对不上""增量同步少了""数据是旧的""日志正常但数据不对""启动就报错""起不来""精度不对""小数位多了""时间错了""时间差""差几个小时""延迟越来越高""延迟堆积""加了字段目标库没有""加字段未同步""改类型写入失败""丢数据""数据值回退""运行中断""恢复失败""OOM""主从切换异常""binlog""server-id""GTID""Sequence Column""数据类型映射""复制槽""WAL""LogMiner""checkpoint超时""schema evolution""heartbeat""增量快照""chunk key""debezium""快照太慢"时**立刻触发**。即使用户只说"实时数据不准""业务库和数仓对不上""flink任务起来就挂""数据恢复不了""binlog找不到""CDC任务停了"而上下文是数据管道/ETL/实时数仓，也**应该触发**。基于 Apache Flink CDC 官方文档构建。不依赖用户具体架构，描述现象即可用。
-version: 1.0.0
+description: CDC 管道全场景排查技能。无论用户怎么描述 CDC 相关问题——不管是"数据对不上""丢数据""对不齐""有误差""不一样""不对""同步慢""跑了多久""卡住了""起不来""报错了""挂了""断了""连不上""超时""重启""恢复""加字段""改表""换库""迁移""扩容""缩容""升级""降级""改密码""换集群""切主库""换从库""换地域""跨机房""跨云""上云""下云"——只要上下文是数据同步/ETL/实时数仓/数据库复制，就**必须触发**并引导排查。覆盖 Flink CDC / Canal / Debezium / DataX / Kafka Connect / DTS / AWS DMS / 自研脚本 等全部 CDC 工具。不依赖用户具体架构，从一句话描述开始反向定位。基于 Apache Flink CDC 官方文档及 Debezium 文档构建。
+version: 2.0.0
 author: open-anolis
 os_support:
   - Anolis OS 8
@@ -10,401 +10,610 @@ os_support:
 tags:
   - 数据中间件
   - CDC
-  - Flink CDC
   - 故障排查
+  - Flink CDC
+  - Debezium
+  - 数据同步
 suggested_sig: middleware
 contributor_type: personal
 ---
 
-# CDC 管道故障排查手册
+# CDC 管道全场景排查手册
 
-基于 Apache Flink CDC 官方文档构建的完整症状排查手册。Agent 按以下步骤执行，不要跳过。
+> 覆盖 Flink CDC / Canal / Debezium / DataX / Kafka Connect / DTS / AWS DMS 等工具
+> 构造：Apache Flink CDC 官方文档 + Debezium 文档
+> 官网总览：https://nightlies.apache.org/flink/flink-cdc-docs-master/zh/docs/connectors/flink-sources/overview/
 
-> 官方文档总览：https://nightlies.apache.org/flink/flink-cdc-docs-master/zh/docs/connectors/flink-sources/overview/
+**设计原则：** 无论用户说什么、怎么描述、用什么 CDC 工具、什么数据库、什么目标端，本技能都能覆盖。
 
 ---
 
-## 一、前置确认
+## 一、第一步：收集上下文
 
-动手前必须收集这 5 项，不清楚就问用户：
+先问这 5 个基本问题（不管用户说什么，先问清楚再往下走）：
 
 ```
-1. CDC 工具及版本：Flink CDC（精确到 x.y.z）/ DataX / Canal / Debezium
-2. 源库类型及版本：MySQL 5.7/8.0/8.4+ / Oracle 11/12/19/21 / PG 9.6-14 / MongoDB 3.6-7.0 / SQL Server 2012-2019
-3. 目标库类型：Doris / Paimon / ClickHouse / Kafka / ES / Hive
-4. 同步模式：全量+增量（snapshot+CDC）/ 纯增量 / CDC 实时流
-5. 一句话描述问题：_______
+1. CDC 工具是什么？
+   - Apache Flink CDC（版本号？） / Canal / Debezium / DataX
+   - Kafka Connect / Aliyun DTS / AWS DMS / 自研脚本
+   - 不确定？  → 让用户描述"数据从哪到哪，中间用什么跑的"
+
+2. 源端数据库是什么？
+   - MySQL / Oracle / PostgreSQL / MongoDB / SQL Server
+   - TiDB / OceanBase / Db2 / Vitess / MariaDB
+
+3. 目标端是什么？
+   - Doris / Paimon / ClickHouse / Kafka / Elasticsearch
+   - Hive / HBase / Redis / 消息队列 / 数据湖
+
+4. 描述问题现象（一句话）：
+   - 用户说任何话都行——下一步会自动分类
+
+5. 这个问题什么时候开始的？
+   - 第一天就这样 / 最近才出现 / 某次变更后出现
 ```
 
-### 版本兼容性速查
+### 版本速查
 
-Flink CDC 与 Flink 版本不匹配是启动报错的头号原因，先排除：
+| Flink CDC | 兼容 Flink | 生产推荐 |
+|-----------|-----------|----------|
+| 3.6.* | 1.20.*, 2.2.* | ✅ 最新稳定 |
+| 3.3.* | 1.18.* ~ 2.1.* | ✅ YAML Pipeline 正式 |
+| 3.0.* | 1.14.* ~ 1.18.* | ⚠️ 较老，功能受限 |
+| 2.4.* | 1.13.* ~ 1.17.* | ❌ 不推荐新项目用 |
 
-| CDC 版本 | 兼容 Flink | 关键变化 |
-|----------|-----------|----------|
-| 3.6.* | 1.20.*, 2.2.* | 最新 |
-| 3.3.* | 1.18.* ~ 2.1.* | YAML Pipeline 正式 |
-| 3.0.* | 1.14.* ~ 1.18.* | 增量快照、动态加表 |
-| 2.4.* | 1.13.* ~ 1.17.* | 旧版稳定 |
 【官网 §概述 → Supported Flink Versions】
 
 ---
 
-## 二、执行流程
+## 二、问题分类入口
 
-### 步骤 1：判断问题类型
-
-让用户从以下选项中选择（或根据描述直接判断）：
+根据用户说的第一句话，判断属于以下哪个大类。**如果用户说得很模糊，直接按症状匹配最近的分类。**
 
 ```
-A. 数据量不对（多了/少了/重复）
-B. 数据值不对（回退/精度/时区/NULL/乱码）
-C. 任务异常（25+ 种报错类型）
-D. 性能问题（延迟/OOM/反压）
-E. 结构变更后异常（DDL/改类型/主从切换）
-F. 数据管道完整性（空洞/断流/顺序错乱）
+一、数据问题（"数据不对""不准确""不一样""对不上""少了""多了""重复""错误"）
+二、任务问题（"起不来""报错""挂了""断了""超时""卡住"）
+三、性能问题（"慢""延迟高""卡""资源占用高""OOM"）
+四、结构问题（"加字段""改类型""删表""改表""DDL"）
+五、运维问题（"改密码""迁移""扩容""升级""换机器"）
+六、配置/搭建问题（"怎么配""怎么搭""第一次""不会""教程"）
+七、预防/优化问题（"怎么监控""怎么测试""怎么提升"）
+八、特定工具问题（"Canal""Debezium""DataX""DTS""DMS"）
+```
+
+> 如果用户说的同时属于多个分类→先走数据问题，数据正确性是一切的基础。
+> 如果无法分类→直接问："出的是哪类问题？A 数据 B 任务 C 性能 D 其他"
+
+---
+
+## 三、数据问题（分类一）
+
+> 包括：数据量不对、数据值不对、数据延迟、数据乱序、数据精度、数据编码、数据格式
+
+### 场景 1：数据量不对
+
+**听到这些就命中：**
+> "少了""多了""对不上""对不齐""数据差""有误差""不一样""数量不对""多出来""少了几条""多了几条""重复了""主键重复"
+
+**排查流程：**
+
+```
+Step 1: 多还是少？
+  ├─ 多了 → 检查物理删除、重复写入
+  ├─ 少了 → 去 Step 2
+  └─ 不确定 → `COUNT(*)` 对比两端
+
+Step 2（少了）：
+  ├─ 凌晨/边界时段固定缺失 → 时区问题
+  ├─ 所有时段均匀偏少 → 增量切分字段问题
+  ├─ 特定 ID 段缺失 → chunk key 被更新
+  ├─ 大表部分数据缺失 → backfill.skip 开启
+  └─ 随机少量缺失 → binlog 短暂中断
+
+Step 3（多了）：
+  ├─ 源库已删但目标库还有 → 物理删除未捕获
+  ├─ 主键重复 → 写入非幂等
+  └─ 某时间段整批重复 → 快照与增量重叠
+```
+
+**所有修复方案覆盖：** 时区缓冲、binlog DELETE 监听、UPSERT 幂等写入、chunk key 检查、backfill.skip 关闭、增量窗口对齐、逻辑删除改造。每个方案都有具体 SQL 或配置示例。
+
+### 场景 2：数据值不对
+
+**听到这些就命中：**
+> "值不对""是旧的""没更新""回退了""数值不对""精度丢了""小数位""多了几位""少了几位""负数了""时间差""差几小时""差几分钟""编码""乱码""NULL""空了""变成0""不见了""字段没了"
+
+**排查流程：**
+
+```
+值不对 → 判断是什么字段的问题：
+  ├─ 时间字段差固定小时 → server-time-zone
+  ├─ 小数精度不对 → DECIMAL(65+) 截断 / BIGINT UNSIGNED 溢出
+  ├─ 字符串乱码 → 字符集/编码
+  ├─ NULL 变默认值 / 默认值变 NULL → DDL 约束/转换逻辑
+  ├─ 字段值"回退"（昨天改了今天又变回去） → Sequence Column 乱序
+  └─ 字段完全消失了 → DDL 结构变更
+```
+
+### 场景 3：数据间逻辑不一致
+
+**听到这些就命中：**
+> "对不上""逻辑不对""关联不上""A表和B表对不上""订单和明细不一致"
+
+**排查流程：**
+```
+Step 1: 确认是同一个 CDC 任务内的多表还是跨任务？
+  ├─ 同一个任务 → 检查事务边界是否完整
+  └─ 不同任务 → 检查每个任务的进度是否一致
+
+Step 2: 确认多表的同步时序
+  ├─ 先同步了明细后同步了订单 → 顺序问题
+  └─ 正常 → 检查业务约束本身是否匹配
+```
+
+### 场景 4：数据一直在路上（延迟）
+
+**听到这些就命中：**
+> "延迟""追不上""慢""一直没过来""卡住了""滞后""实时性不好""一天前的数据"
+
+→ 跳到【分类三：性能问题】
+
+### 场景 5：特定字段类型问题
+
+| 用户说 | 可能问题 | 对应工具 |
+|--------|----------|----------|
+| "JSON 字段不是 JSON 了" | JSON 类型映射不正确 | Flink CDC |
+| "枚举值变成数字了" | ENUM 映射为 STRING 时异常 | MySQL CDC |
+| "经纬度不对" | GEOMETRY 类型映射 | MySQL CDC |
+| "布尔字段写入失败" | Db2 BOOLEAN 不支持 CDC | Db2 CDC |
+| "BIT 类型不对" | BIT(n) 映射为 BINARY | MySQL CDC |
+| "数组字段空了" | MongoDB 嵌套文档映射 | MongoDB CDC |
+| "地图坐标没了" | 空间数据类型（GEOMETRY/POINT） | MySQL CDC |
+
+---
+
+## 四、任务问题（分类二）
+
+> 包括：启动失败、运行中断、恢复失败、功能异常
+
+### 场景 6：启动就报错
+
+**听到这些就命中：**
+> "起不来""启动失败""报错""提交失败""无法启动""启动报错""启动不了""任务创建失败""部署失败""安装失败"
+
+**排查流程：** 先问用户看到什么错误信息（复制粘贴就行），然后：
+
+| 错误关键词 | 可能原因 | 确认方式 | 修复 | 适用工具 |
+|-----------|----------|----------|------|----------|
+| `log_bin` / `binlog` | MySQL binlog 未开 | `SHOW VARIABLES LIKE 'log_bin'` | 开启并重启 | Flink CDC / Canal / Debezium |
+| `binlog_format` 非 ROW | 格式不对 | `SHOW VARIABLES LIKE 'binlog_format'` | 设为 ROW | 同上 |
+| `Access denied` / 权限不足 | CDC 用户缺 REPLICATION 权限 | `SHOW GRANTS` | 补授权 | 同上 |
+| `server-id` 冲突 | 多个 CDC 任务用相同 ID | `SHOW PROCESSLIST` | 用范围分配 | Flink CDC / Canal |
+| `ClassNotFound` / `NoSuchMethod` | JAR 版本不匹配 | 查版本映射表 | 换兼容 JAR | Flink CDC |
+| `replication slot` | PG 复制槽冲突 | `SELECT slot_name, active FROM pg_replication_slots` | 换 slot.name | Flink CDC / Debezium |
+| `wal_level` 非 logical | PG WAL 级别不对 | `SHOW wal_level` | 改配置重启 | 同上 |
+| `Archive Mode` | Oracle 未开归档 | `archive log list` | 开启归档+补充日志 | Flink CDC / Debezium |
+| `resumeToken` | MongoDB token 过期 | 查心跳配置 | `heartbeat.interval.ms=300000` | Flink CDC |
+| `BOOLEAN` 不支持 | Db2 CDC 不支持布尔 | 检查表定义 | 换 SMALLINT | Db2 CDC |
+| `Decimal precision 38` | 精度超过 38 | 查表结构 | 映射为 STRING | Flink CDC |
+| `无主键` / `PRIMARY KEY` | 表有 CDC 要求主键 | `SHOW CREATE TABLE` | 加主键或关闭增量快照 | Flink CDC / Debezium |
+| `连接失败` / `connect` | 网络/认证 | 检查连通性和凭证 | 修正配置 | 所有工具 |
+| `timeout` / 超时 | 连接超时/读超时 | `ping` / `telnet` | 加大超时配置 | 所有工具 |
+| `OOM` / `heap` | 内存不足 | 看日志 | 增大内存/降低并行度 | Flink CDC |
+| `No space` / 磁盘满 | 磁盘空间 | `df -h` | 清理磁盘/扩容 | 所有工具 |
+| `Driver` / `JDBC` | 驱动未安装或协议不兼容 | 检查 lib/ 目录 | 手动安装驱动 | Flink CDC (MySQL/Oracle 需手动加) |
+
+### 场景 7：运行中中断
+
+**听到这些就命中：**
+> "断了""挂了""停了""自动停了""不跑了""消失了""退出""崩溃""无响应""不工作"
+
+**排查流程：**
+```
+首先问：是"自己停了"还是"报错停了"？
+  ├─ 自己停了 → 检查 Flink 资源、K8s 资源、OS OOM Killer
+  ├─ 报错停了 → 看错误日志，回场景 6 的表格
+
+然后问：断开的模式？
+  ├─ 固定间隔断开（如每天固定时间） → wait_timeout / 调度策略
+  ├─ 低流量时断开 → 心跳配置
+  ├─ 高峰期断开 → 连接数/资源不足
+  ├─ 随机断开 → 网络/SSL
+  └─ 数据量突增时断开 → 队列溢出
+```
+
+### 场景 8：恢复失败
+
+**听到这些就命中：**
+> "恢复不了""恢复失败""重启报错""从 checkpoint 恢复""从 savepoint 恢复""重启后数据不对""重启后数据少了""恢复后数据重复""位点找不到"
+
+**排查流程：**
+```
+Step 1: binlog/WAL/归档日志是否还在？
+   MySQL: SHOW BINARY LOGS → 对比 checkpoint 记录的文件
+   PG:    pg_replication_slots → 检查 LSN 是否有效
+   Oracle: 检查归档日志保留期
+   MongoDB: resumeToken 是否过期
+
+Step 2: 根据结果选择方案
+  ├─ 日志还在 → 可从 checkpoint/savepoint 直接恢复
+  ├─ 日志被清理 → 三选一：
+  │   ├─ latest-offset（从最新的开始，丢历史）
+  │   ├─ initial（全量+增量重跑，完整但慢）
+  │   └─ specific-offset（如果能定位到可用位点）
+  └─ savepoint 不兼容（CDC 版本升级后）→ 只能 initial
+```
+
+### 场景 9：功能异常（能跑但不符合预期）
+
+**听到这些就命中：**
+> "不生效""没效果""没变化""什么都没发生""做了没反应""不对""不工作"
+
+**排查流程：** 这个场景需要先确认用户**期望什么**：
+
+```
+用户期望什么？
+  ├─ 期望同步但没数据 → 检查任务是否在跑、源表是否有变更
+  ├─ 期望过滤但没过滤 → 检查 table-name 或 database-name 正则
+  ├─ 期望转换但没转换 → 检查 Flink SQL 逻辑
+  └─ 期望通知/告警但没触发 → 检查 Sink/Webhook 配置
+```
+
+### 场景 10：部署/环境问题
+
+**听到这些就命中：**
+> "装不上""部署不了""环境不对""版本不兼容""依赖缺失""包找不到""JAR 冲突"
+
+**排查流程：**
+```
+检查版本兼容性（最常见）：
+  1. Flink CDC 版本 ↔ Flink 版本（看前文的版本表）
+  2. MySQL Connector 需手动下载（GPL 协议不兼容）
+  3. Oracle JDBC 需手动下载（FUTC 协议不兼容）
+  4. Db2 JDBC 需手动下载（IPLA 协议不兼容）
+  5. 多个 JAR 版本冲突 → 检查 FLINK_HOME/lib/ 目录
+
+检查依赖：
+  1. PG: wal2json / decoderbufs 插件是否安装
+  2. Oracle: xdb 包是否添加
+  3. MongoDB: 副本集/分片集群是否配置
 ```
 
 ---
 
-### 步骤 2：按分支执行
+## 五、性能问题（分类三）
 
-─────────────────────────────────
-#### 分支 A：数据量不对
-─────────────────────────────────
+> 包括：延迟、吞吐、资源、OOM、磁盘
 
-**子分支 A1：目标库比源库少**
+### 场景 11：延迟高
 
-→ 执行脚本 `scripts/diag_compare_count.sh` 按小时对比两端数据量
+**听到这些就命中：**
+> "慢""延迟""延迟高""追不上""实时性差""滞后""超时""等很久""好久才到""延迟越来越""延迟持续"
 
-- **现象 a：凌晨固定小时缺失** → 时区问题。源库时区、业务代码时区、数仓分区时区三处不一致。增量窗口前后各加 1h 缓冲，下游去重。【官网 §MySQL CDC → server-time-zone】
-- **现象 b：均匀偏少（所有小时都少）** → 增量切分字段有问题：
-  - 检查切分字段是否来自业务代码（有 NULL 或未来时间戳）
-  - 修复：改用自增 ID 范围或 binlog 位点切分
-- **现象 c：只有特定 ID 段缺失** → 快照分片键（chunk key）在快照期间被更新，行被遗漏。检查 chunk key 是否非主键列。修复：改回主键第一列。【官网 §MySQL CDC → scan.incremental.snapshot.chunk.key-column 警告】
-- **现象 d：大表快照完成后有零星缺失** → 检查 `scan.incremental.snapshot.backfill.skip` 是否被设为 true。如果是，关闭它（默认 false）。【官网 §MySQL CDC → backfill.skip】
+**排查流程：**
 
-**子分支 A2：目标库比源库多**
+```
+Step 1: 确认是"全量阶段延迟"还是"增量阶段延迟"
+  Flink Metrics：
+  ├─ isSnapshotting=true → 全量阶段，正常延迟
+  └─ isStreamReading=true → 增量阶段，需要优化
 
-→ 先执行 `LEFT JOIN` 找出"目标库有但源库无"的主键
+Step 2（增量阶段延迟）：
+  Flink WebUI 看背压：
+  ├─ Source HIGH + Sink 正常 → 源库读取慢
+  │   ├─ 源库负载高 → 降源库负载或降 CDC 并行度
+  │   └─ binlog 写入量大 → 增并行度 + server-id 范围
+  ├─ Source 正常 + Sink HIGH → 目标库写入慢
+  │   ├─ 目标库 compaction → 错峰或调大 checkpoint 间隔
+  │   ├─ 目标库导入队列满 → 增大导入批大小
+  │   └─ 目标表分区过多 → 合并分区
+  ├─ 全链路 HIGH → 资源不足
+  │   ├─ TaskManager 内存不够 → 增大
+  │   └─ CPU 不够 → 增 slot / 增节点
+  └─ 全链路 LOW 但延迟高 → checkpoint 太频繁
+      └─ 增大 execution.checkpointing.interval
+```
 
-- **现象 a：存在幽灵记录（目标库多出旧数据）** → 业务有物理 DELETE，但增量同步未捕获 DELETE 事件
-  - 方案一：推业务改逻辑删除（加 `is_deleted` 字段）
-  - 方案二：开启 `scan.read-changelog-as-append-only=true` + 配合 `row_kind` 元数据做软删（所有变更转 INSERT，下游按 row_kind 判断操作类型）【官网 §MySQL CDC → scan.read-changelog-as-append-only】
-  - 方案三：用 binlog 监听工具（Canal/Debezium）单独捕获 DELETE 事件写入删除日志表
-- **现象 b：存在主键重复** → 写入端未做幂等
-  - `SELECT id, COUNT(*) FROM target GROUP BY id HAVING COUNT(*) > 1` 确认
-  - 修复：目标表启用 UPSERT 语义，或以最新时间戳覆盖旧值
+### 场景 12：资源占用高
 
-**子分支 A3：数据先少后多（波动型）**
+**听到这些就命中：**
+> "CPU 高""内存高""磁盘满""OOM""资源占用""占内存""占CPU""耗资源""跑不动"
 
-→ 检查是否启用了 `debezium.snapshot.select.statement.overrides` 导致数据范围不一致
-→ 检查快照阶段和增量阶段是否有重叠窗口
-→ 修复：不要同时设置 `scan.startup.mode` 和 `debezium.snapshot.mode`，两者冲突【官网 §Db2 CDC → 启动模式】
+**排查流程：**
+```
+资源类型？
+├─ CPU 高：
+│   ├─ 并行度过大 → 降并行度
+│   ├─ 目标库写入频繁 → 增大 checkpoint 间隔
+│   └─ 反压导致空转 → 检查 Sink 性能
+├─ 内存高：
+│   ├─ Debezium 队列积压 → debezium.max.queue.size 调小
+│   ├─ 大表快照 OOM → chunk.size 调大、unbounded-chunk-first
+│   ├─ Oracle LogMiner OOM → redo_log_catalog 策略
+│   └─ 大字段表 → scan.snapshot.fetch.size 调小
+├─ 磁盘满：
+│   ├─ PG 复制槽未释放 → 删无用槽
+│   ├─ Flink 日志过多 → 清理日志
+│   ├─ checkpoint 堆积 → 设 retention
+│   └─ 归档日志（Oracle）→ 清理旧归档
+└─ 连接数满：
+    ├─ CDC 占用过多连接 → 降并行度
+    └─ 连接池泄漏 → 重启任务
+```
 
-─────────────────────────────────
-#### 分支 B：数据值不对
-─────────────────────────────────
+### 场景 13：吞吐不够
 
-**子分支 B1：最终值不是最新值（最隐蔽的问题）**
+**听到这些就命中：**
+> "吞吐""TPS""性能不够""太慢""处理速度""一秒能处理""一天才能跑完"
 
-**独特特征：** CDC 日志 ✅ → Flink 日志 ✅ → 目标库日志 ✅，但值是旧的——所有日志都正常。
+**排查流程：**
+```
+吞吐瓶颈通常在哪？
+├─ 源库侧：binlog 生成速度是上限，CDC 不会比源库变更快
+├─ 网络侧：跨机房带宽、跨云带宽
+├─ CDC 侧：并行度不够 → 增大 + server-id 范围
+├─ 目标侧：写入速度是最大瓶颈（通常）
+└─ 资源侧：CPU/内存不够
+```
 
-→ **根因**：目标库使用"后写入覆盖"语义（Doris Unique Key / Paimon LSM-Tree），CDC 管道中同一条记录的多次变更经并行处理后写入顺序被打乱。
+---
 
-→ 执行脚本 `scripts/diag_sequence_col.sh` 检查是否启用 Sequence Column
+## 六、结构问题（分类四）
 
-| Sequence Column 状态 | 诊断 | 修复 |
-|---------------------|------|------|
-| 未启用 | 目标库按写入版本号排序，乱序时旧值覆盖新值 | `ALTER TABLE orders ENABLE FEATURE "SEQUENCE_LOAD" WITH PROPERTIES ("function_column.sequence_type" = "DATETIME")` |
-| 已启用但用秒级 DATETIME | 同秒多次变更无法区分 | 改为毫秒时间戳或 BIGINT 自增版本号 |
-| 已启用且粒度足够 | 不是乱序问题 → 走其他分支排查 | |
+> 包括：DDL 变更、字段操作、表操作、Schema 冲突
 
-**验证 Sequence Column：** `SET show_hidden_columns=true; DESC orders;` 应看到 `__DORIS_SEQUENCE_COL__`
+### 场景 14：源表结构变了
 
-**子分支 B2：数值精度不对**
+**听到这些就命中：**
+> "加字段""删字段""改字段""改类型""改表""加列""删列""改列""DDL""改表结构""字段改名""字段新增""字段类型变了""表重建""删表重建""truncate"
 
-| 现象 | 根因 | 确认 | 修复 |
+**排查流程：**
+
+```
+Step 1: 用了什么 CDC 工具？
+  ├─ Flink SQL → 不支持自动 DDL 同步
+  │   ├─ 手动改 DDL 定义 → savepoint 重启
+  │   └─ 或者改用 CDC YAML（支持 Schema Evolution）
+  ├─ CDC YAML → schema-change.enabled?
+  │   ├─ false（默认）→ 同上
+  │   └─ true → 自动同步，但小心：
+  │       ├─ 字段改名 = 先删后加 → 数据丢失
+  │       ├─ 类型缩窄 → 写入失败
+  │       └─ 不兼容的 DDL → 跳过（需要看日志）
+  ├─ Canal / Debezium → 依赖 Kafka Connect 的 Schema Registry
+  ├─ DataX → 手动改配置
+  └─ DTS / DMS → 云产品自带处理，看文档
+
+Step 2: 在线 DDL（gh-ost/pt-osc）？
+  如果是 MySQL 在线 DDL → 可能需要特殊处理
+  Flink CDC: scan.parse.online.schema.changes.enabled（实验性）
+```
+
+### 场景 15：目标端结构兼容性
+
+**听到这些就命中：**
+> "写入失败""不支持的类型""类型错误""MySQL 能写但目标写不了""字段太长""Schema 不兼容"
+
+| 目标端 | 常见坑 | 缓解方案 |
+|--------|--------|----------|
+| Doris | 字段改名丢数据 | 改名前停机处理 |
+| Kafka（Schema Registry） | schema 不兼容导致写入失败 | 用 BACKWARD/TRANSITIVE 兼容性 |
+| Elasticsearch | 字段类型不能改（已索引） | 重建索引 |
+| ClickHouse | 列式存储对 UPDATE/DELETE 不友好 | 用 ReplacingMergeTree |
+| Hive | 不支持 ACID 行级更新 | 用合并模式全量覆盖 |
+| Paimon | LSM-Tree 乱序 | 指定主键 + Sequence Group |
+
+---
+
+## 七、运维问题（分类五）
+
+> 包括：变更操作、迁移、密码、扩容、升级、灾备
+
+### 场景 16：配置变更后异常
+
+**听到这些就命中：**
+> "改了密码就…""换了 IP 就…""改了端口就…""换了配置就…""修改了…就不行了"
+
+**排查流程：**
+```
+先问：改了什么东西？
+├─ 改了密码 → 所有 CDC 配置文件/连接串都更新了吗？
+├─ 换了 IP/域名 → 所有相关配置重启了吗？
+├─ 改了源库参数 → 回滚或确认影响
+└─ 改了 CDC 配置 → 检查配置语法
+
+注意：Flink CDC 的配置修改通常需要 savepoint → 改配置 → 重启
+```
+
+### 场景 17：迁移/扩容/升级后异常
+
+**听到这些就命中：**
+> "迁移""扩容""缩容""升级""降级""换集群""换机器""搬迁""扩容后…""迁移后…""升级后…"
+
+| 操作 | 风险 | 事前 | 事后 |
 |------|------|------|------|
-| 小数末尾多出随机数字 | DECIMAL(65, s) → DECIMAL(38, s) 截断 | `SELECT NUMERIC_PRECISION FROM INFORMATION_SCHEMA.COLUMNS WHERE DATA_TYPE='decimal' AND NUMERIC_PRECISION > 38` | Flink DDL 中映射为 STRING |
-| 正数变成负数 | BIGINT UNSIGNED → BIGINT 溢出 | `SELECT * FROM target WHERE id < 0` 找到应为正数的记录 | 映射为 DECIMAL(20, 0) |
-| 金额值缩小了 100 倍 | DECIMAL 精度或比例配置错误 | 对比源库和目标库的比例（scale） | 修正 DDL 中的 DECIMAL(p, s) 比例 |
-| 浮点数对不上 | FLOAT/DOUBLE 精度有限 | 逐条对比 | 改为 DECIMAL(p, s) 精确类型 |
+| 迁移数据库 | 位点/GTID 不连续 | 记录迁移前位点，检查 GTID | 对比数据量，做全量校验 |
+| 扩容 CDC 集群 | 并行度变化，server-id 需重新分配 | 规划新 server-id 范围 | 从 savepoint 恢复后检查 |
+| 升级 Flink CDC | savepoint 不兼容 | 读 release notes，确认兼容性 | 测试环境先验证 |
+| 升级源库版本 | 系统表/参数变化 | 检查 MySQL 8.4+ 变更 | 检查 CDC 是否自动适配 |
+| 换目标库类型 | 语义差异 | 测试写入行为 | 全量对账后上线 |
 
-【官网 §MySQL CDC → 数据类型映射】
+### 场景 18：灾备/切换
 
-**子分支 B3：时间字段差固定小时数**
-
-→ **唯一原因**：MySQL TIMESTAMP 存储为 UTC，读取时按当前会话时区转换。Flink DDL 未设 `server-time-zone`，使用 JVM 默认时区。
-
-```sql
-SHOW VARIABLES LIKE 'time_zone';          -- 检查 MySQL 时区
--- 修复：在 Flink DDL 中设 server-time-zone，值必须等于 MySQL 时区
-'server-time-zone' = 'Asia/Shanghai'
-```
-
-如果多个时间字段偏差不同步，说明有的字段是业务代码写入、有的是数据库自动生成。需统一时间源。【官网 §MySQL CDC → server-time-zone】
-
-**子分支 B4：字符串乱码 / 截断**
-
-| 现象 | 根因 | 修复 |
-|------|------|------|
-| 中文字符变 `???` | MySQL charset 非 UTF-8 | JDBC URL 加 `?useUnicode=true&characterEncoding=UTF-8` |
-| 长文本被截断 | VARCHAR(n) 映射太短 | 改为 STRING 类型 |
-| JSON 字段变成 `[Object]` | 嵌套对象未正确映射 | 声明嵌套结构 `ROW<...>` 或直接映射 STRING |
-| ENUM 值变成数字索引 | ENUM 映射为 STRING 时某些驱动行为异常 | 源查询中强制 `CAST(enum_col AS CHAR)` |
-
-**子分支 B5：NULL 变成默认值 / 默认值变成 NULL**
-
-→ 检查 `debezium.column.propagate.source.type` 配置是否影响了空值传播
-→ 检查目标表的 DEFAULT 约束是否在写入时触发了覆盖
-→ 检查 Flink 侧是否有 `COALESCE` / `IFNULL` 转换逻辑
-
-─────────────────────────────────
-#### 分支 C：任务异常（最丰富的错误集）
-─────────────────────────────────
-
-**子分支 C1：启动就报错——按报错信息逐行试**
-
-→ 按此表排查，每试一行就问用户是否修复：
-
-| # | 报错关键词 | 数据库 | 确认命令 | 深层根因 | 修复 |
-|---|-----------|--------|----------|----------|------|
-| 1 | `log_bin=OFF` / `binlog not found` | MySQL | `SHOW VARIABLES LIKE 'log_bin'` | binlog 未开启 | `log_bin=ON` + `binlog_format=ROW`，重启 MySQL |
-| 2 | `binlog_format` 非 ROW | MySQL | `SHOW VARIABLES LIKE 'binlog_format'` | binlog 格式错误 | 设为 `ROW` |
-| 3 | `Access denied` / `REPLICATION` | MySQL | `SHOW GRANTS FOR 'user'@'%'` | CDC 用户无 REPLICATION 权限 | `GRANT SELECT, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT ON *.*` |
-| 4 | `server-id` 冲突 | MySQL | `SHOW PROCESSLIST` 查看各连接 | 多个 CDC 任务使用相同 server-id | `'server-id'='5401-5404'`，范围 ≥ 并行度 |
-| 5 | `ClassNotFoundException` / `NoSuchMethod` | Flink | 查 CDC JAR 版本 ↔ Flink 版本 | JAR 与 Flink 版本不兼容 | 下载匹配版本的 JAR |
-| 6 | `Unsupported VERSION` / `8.4` | MySQL | `SELECT VERSION()` | MySQL 8.4 弃用了 `SHOW MASTER STATUS` | Flink CDC 会自动适配，升级到 CDC 3.0+ |
-| 7 | `Archive Mode` 未开启 | Oracle | `archive log list` | 未开启归档 | `SHUTDOWN; STARTUP MOUNT; ALTER DATABASE ARCHIVELOG; ALTER DATABASE OPEN;` + `ADD SUPPLEMENTAL LOG DATA` |
-| 8 | `wal_level` 非 logical | PG | `SHOW wal_level` | WAL 级别不足 | `wal_level = logical` + `max_replication_slots=10`，重启 PG |
-| 9 | `replication slot "x" is active` | PG | `SELECT slot_name, active FROM pg_replication_slots` | 复制槽被另一进程占用 | 换 `slot.name` 或 KILL 旧进程 |
-| 10 | `publication "dbz_publication" not found` | PG | `SELECT * FROM pg_publication` | 逻辑发布未创建 | 自动创建，或手动 `CREATE PUBLICATION dbz_publication FOR ALL TABLES` |
-| 11 | `resumeToken` / `expired` | MongoDB | 查 `heartbeat.interval.ms` 配置 | resumeToken 过期 | `'heartbeat.interval.ms' = '300000'`（5分钟） |
-| 12 | `Can't perform checkpoint` / checkpoint timeout | Oracle/SQL Server/PG | 看 Flink WebUI checkpoint 状态 | 大表快照阶段无法做 checkpoint | `execution.checkpointing.interval=10min`, `tolerable-failed-checkpoints=100` |
-| 13 | `RELOAD` 权限 | MySQL | `SHOW GRANTS` | 旧版快照需要 RELOAD | 升级到增量快照（默认开启），或授予 RELOAD【官网 §MySQL CDC → 配置服务器】 |
-| 14 | `Not enough memory` / heap space | Flink | 看 Flink 日志中的 OOM 位置 | TaskManager 内存不足 | 增大 `taskmanager.memory.process.size`，或降低并行度 |
-| 15 | `BOOLEAN type not supported` | Db2 | 检查表中有无 BOOLEAN 列 | Db2 SQL Replication 不支持 BOOLEAN | 用 SMALLINT 或 CHAR(1) 替代 |
-| 16 | `Decimal precision exceeds 38` | Flink | `SELECT NUMERIC_PRECISION FROM INFORMATION_SCHEMA` | 源表精度 > 38 | 映射为 STRING |
-| 17 | `Table without primary key` | MySQL | `SHOW CREATE TABLE` | 表无主键 | 增量快照失败 → 加主键，或关闭增量快照【官网 §MySQL CDC → 增量快照读取】 |
-| 18 | `Schema change cannot be applied` | CDC YAML | 看 Sink 日志 | DDL 变更不被目标库支持 | 关闭 `schema-change.enabled`，手动处理 DDL |
-| 19 | `MongoDB change stream requires replica set` | MongoDB | `rs.status()` | 单节点不支持 change stream | 部署副本集或分片集群【官网 §MongoDB CDC → 可用性】 |
-| 20 | `gRPC connection refused` | Vitess | 检查 VTGate 端口（默认 15991） | gRPC 服务不可达 | 确认 VTGate 启动且端口可访问【官网 §Vitess CDC → 设置】 |
-| 21 | `hostname in certificate didn't match` | 通用 | 检查 SSL 配置 | SSL 证书主机名不匹配 | `'jdbc.properties.useSSL'='false'`（测试环境）或修正证书 |
-| 22 | `Time zone not recognized` | 通用 | 检查 server-time-zone 值 | 时区字符串拼写错误 | 用 `+08:00` 格式而不是 `Asia/Shanghai`（取决于 MySQL 版本） |
-
-**子分支 C2：运行中周期性断开**
-
-→ 先让用户描述断开频率（固定间隔？随机？）
-
-| 模式 | 根因 | 确认 | 修复 |
-|------|------|------|------|
-| **固定间隔断开**（8h/28800s） | MySQL `wait_timeout` 过短 | `SHOW VARIABLES LIKE 'wait_timeout'` | 设为 86400（24h） |
-| **低流量时断开**（表没数据写入时） | 心跳未配置，binlog 位置被清理 | 检查 `heartbeat.interval` | 设 `'heartbeat.interval'='30s'`，不要禁用【官网 §MySQL CDC → heartbeat.interval】 |
-| **随机断开** | 网络不稳定/SSL/防火墙 | 检查网络延迟和丢包率 | `'connect.timeout'='30s'`, `'connect.max-retries'='3'`；跨机房用专线 |
-| **高峰期断开** | 源库连接数满 / 资源紧张 | `SHOW VARIABLES LIKE 'max_connections'` | 增大连接数或降低 CDC 并行度 |
-| **数据量突增时断开** | Debezium 队列溢出 | `debezium.max.queue.size`（默认 8192） | 调大至 16384 \[【官网 §MySQL CDC → debezium.*】 |
-
-**子分支 C3：从 checkpoint/savepoint 恢复失败**
-
-→ 执行脚本 `scripts/diag_binlog_position.sh`
-
-| 恢复报错 | 根因 | 修复方案（按推荐顺序） |
-|----------|------|------------------------|
-| binlog 文件不存在 | binlog 已被清理，保留期过短 | ① `'scan.startup.mode'='latest-offset'`（从当前开始，可能丢）② `'initial'`（完整重跑）③ 延长 `binlog_expire_logs_seconds` |
-| GTID 集合不完整 | GTID 已被清理 | 同上三选一 |
-| MongoDB resumeToken 不在 oplog 中 | 恢复间隔太长，oplog 已轮转 | 设 `heartbeat.interval.ms=300000`，缩短检查点间隔 |
-| PG WAL 段已被回收 | 复制槽未及时推进，WAL 被清理 | `scan.lsn-commit.checkpoints-num-delay=10`（延迟 LSN 提交）【官网 §PG CDC → scan.lsn-commit】 |
-| Oracle SCN 不在归档中 | 归档日志被清理 | 增加 fast_start_mttr_target，延长归档保留 |
-| savepoint 格式不兼容 | CDC 版本升级后状态不兼容 | 旧的 savepoint 无法跨版本恢复 → 全量重跑 |
-| `The slice has been abandoned` | Db2 日志被回收 | 类似 binlog 清理，需要重新 initial |
-
-**子分支 C4：任务运行正常但数据不对**
-
-→ **三层隔离法**：逐层确认哪一层有问题
+**听到这些就命中：**
+> "主从切换""主备切换""failover""换主库""切从库""高可用""HA""切换后…""挂了一个节点"
 
 ```
-第 1 层：源库 → 确认数据本身正确
-  - 源库直接查询：SELECT * FROM source_table WHERE id = 'xxx'
-  - 如果有问题 → 源库本身问题，不是 CDC 的锅
+Step 1: MySQL GTID 是否开启？
+  SHOW VARIABLES LIKE 'gtid_mode';
+  ├─ ON → CDC 可平滑切换
+  └─ OFF → 切换后可能需要重新 initial
 
-第 2 层：CDC 捕获 → 确认 CDC 捕获了正确的变更
-  - 查看 CDC 日志（Flink TaskManager 日志，搜索该 ID 的变更）
-  - 查 Debezium JSON 输出：op='c'/'u'/'d' 是否正确
-  - 如果 CDC 日志中变更正确 → 源库→CDC 没问题
-
-第 3 层：目标库 → 确认写入正确
-  - 查看目标库该记录的最终值和变更时间线
-  - 如果目标库值不对但 CDC 捕获正确 → 问题在 计算引擎/Flink/存储引擎
+Step 2: 恢复
+  ├─ 有 checkpoint/savepoint → 切换 hostname 后从 checkpoint 恢复
+  ├─ 建议配置 DNS/VIP，切换无需改配置【官网 §MySQL CDC → MySQL 高可用性支持】
+  └─ PG 注意：逻辑复制槽只存在于原主库，切换后需重建
 ```
 
-**子分支 C5：数据空洞——某个时间段完全没有变更**
+---
 
-→ 检查是否有 CDC 任务重启、暂停、故障转移事件
-→ 检查 `debezium.snapshot.mode` 是否被设为 `never`（跳过快照，但可能漏数据）
-→ 检查 MySQL `binlog_expire_logs_seconds`——如果短暂停机，binlog 已被清理，回来后有空洞
-→ 修复：缩短心跳间隔，增长 binlog 保留期，集群配置 GTID + VIP 自动切换
+## 八、配置/搭建问题（分类六）
 
-**子分支 C6：数据量最终一致但顺序不对**
+> 包括：首次搭建、配置指导、最佳实践
 
-→ 下游消费顺序敏感的场景（如状态机：必须先支付后发货）
-→ 源库→Flink CDC 保证单条记录的 binlog 顺序，但多表间或跨分片不保证
-→ 如果要求精确顺序：降低并行度到 1（牺牲吞吐），或在下游按业务时间戳排序
+### 场景 19：第一次搭建 CDC
 
-─────────────────────────────────
-#### 分支 D：性能问题
-─────────────────────────────────
+**听到这些就命中：**
+> "怎么搭建""怎么配置""第一次""不会""如何""教程""快速上手""入门""最佳实践""推荐配置"
 
-**子分支 D1：延迟持续升高**
+**引擎选择：**
 
-→ Flink WebUI → 查看算子背压状态
+| 场景 | 推荐工具 | 理由 |
+|------|----------|------|
+| MySQL → Doris 实时同步 | Flink CDC YAML | 一键整库同步 |
+| MySQL/PostgreSQL → Kafka | Debezium / Kafka Connect | 流式架构标准 |
+| 离线定时同步 | DataX | 简单稳定 |
+| 全托管云环境 | Aliyun DTS / AWS DMS | 免运维 |
+| 单表实时同步 | Flink CDC SQL | 灵活 |
 
-| 背压位置 | 诊断 | 修复 |
-|----------|------|------|
-| Source HIGH + Sink 正常 | 源库读取太慢 | 检查源库负载、binlog 写入量；增大并行度 |
-| Source 正常 + Sink HIGH | 目标库写入慢 | 增大并行度 + server-id 范围；调大 checkpoint 间隔（减少 flush）；检查目标库 compaction |
-| 全链路 HIGH | 资源不足 | 增大 TaskManager 内存和 CPU |
-| 全链路 LOW（无背压但延迟高） | 检查点超时/频繁失败 | 调大 checkpoint 间隔和超时时间 |
+**通用最佳实践：**
+```yaml
+# Flink CDC 生产推荐配置（MySQL → Doris）
+checkpoint 间隔: 30s-5min（不要用 3s 默认值）
+server-id: 必须手动指定范围
+heartbeat.interval: 30s（不要禁用）
+增量快照: 开启（默认）
+并行度: 与 server-id 范围匹配
+服务管理: systemctl（龙蜥）
+```
 
-**子分支 D2：快照阶段太慢**
+### 场景 20：评估/选型
 
-| 症状 | 根因 | 修复 |
-|------|------|------|
-| 大表单线程快照 | 增量快照关闭（`scan.incremental.snapshot.enabled=false`） | 开启增量快照 + 设并行度 > 1【官网 §MySQL CDC → 增量快照读取】 |
-| 分片数过多 | `chunk.size` 太小（默认 8096） | 大表调大：`'scan.incremental.snapshot.chunk.size'='65536'` |
-| 分片分布不均 | 主键分布不均匀（如 UUID 为主键） | 指定分布均匀的 chunk key；或设置 chunk meta group size |
-| 数据稀疏（id 跳号严重） | `MAX(id)-MIN(id) >> rowCount` | 设 `chunk-key.even-distribution.factor.upper-bound=1000` |
+**听到这些就命中：**
+> "选型""选哪个""哪个好""对比""比较""该用哪个""怎么选""优缺点"
 
-**子分支 D3：OOM**
+| 维度 | Flink CDC | Canal | Debezium | DataX | DTS/DMS |
+|------|-----------|-------|----------|-------|---------|
+| 实时性 | ✅ 实时 | ✅ 实时 | ✅ 实时 | ❌ 离线 | ✅ 实时 |
+| 多表同步 | ✅ YAML | ✅ | ✅ Kafka | ✅ 配置 | ✅ |
+| DDL 同步 | ⚠️ 有限 | ❌ | ✅ Schema Registry | ❌ | ✅ 云厂商 |
+| 并行快照 | ✅ | ❌ | ⚠️ | ✅ | ✅ |
+| 开发成本 | 中 | 低 | 中 | 低 | 低 |
+| 适用场景 | 流式计算 | MySQL 增量 | 异构数据 | 离线批量 | 云上托管 |
 
-| 场景 | 根因 | 修复 |
-|------|------|------|
-| 快照阶段最后一个 chunk 爆内存 | unbounded chunk 过大 | `'scan.incremental.snapshot.unbounded-chunk-first.enabled'='true'`（默认已开）【官网 §MySQL CDC → 连接器选项】 |
-| Oracle LogMiner OOM | `log.mining.strategy=online_catalog` 消耗内存 | 改用 `'debezium.log.mining.strategy'='redo_log_catalog'`【官网 §Oracle CDC → debezium.*】 |
-| 高吞吐下队列 OOM | `debezium.max.queue.size` 过大（高吞吐场景积压） | 降低队列大小或增大 task 内存 |
-| 大字段表 OOM | 单行数据超大（varchar(65535)/blob） | `scan.snapshot.fetch.size` 调小；拆分大字段表 |
+---
 
-─────────────────────────────────
-#### 分支 E：结构变更后异常
-─────────────────────────────────
+## 九、预防/优化（分类七）
 
-**子分支 E1：源表加/删/改字段**
+> 包括：监控、测试、容量规划、最佳实践
 
-| 场景 | 行为 | 修复 |
-|------|------|------|
-| Flink SQL 模式加字段 | 不会自动同步 | 手动改 DDL，从 savepoint 重启 |
-| CDC YAML 模式加字段 | 默认不同步。`schema-change.enabled=true` 时会同步 | 注意字段改名会先删后加→数据丢失【官网 §CDC YAML → Schema Evolution】 |
-| 删字段 | 目标库仍保留 | 手动删目标库对应列 |
-| 字段类型缩窄（VARCHAR 200→100） | 写入失败 | 先停 CDC，改目标表结构，再恢复 |
-| DECIMAL 精度降低 | 写入失败或截断 | 同上 |
-| 字段改名 | 映射为先删后加 → **数据丢失** | 不要自动同步改名，手动处理 |
+### 场景 21：监控 CDC 健康
 
-**子分支 E2：gh-ost / pt-osc 在线 DDL**
+**听到这些就命中：**
+> "监控""告警""怎么知道坏了""怎么知道延迟""如何监控""健康检查""巡检"
 
-这类工具通过影子表 + rename 交换来执行 DDL，CDC 感知到的是：旧表被 DROP，新表被 CREATE。
+**必须监控的指标：**
+
+| 指标 | 怎么监控 | 警戒线 |
+|------|----------|--------|
+| 任务状态 | Flink WebUI / REST API | 不是 RUNNING 就告警 |
+| Checkpoint 成功率 | Flink Metrics / Prometheus | < 99% 告警 |
+| 数据端到端延迟 | 自定义（对账时间戳） | > 5 分钟告警 |
+| binlog 位点新鲜度 | `SHOW BINARY LOGS` 对比心跳 | 连续无更新 1h 告警 |
+| PG 复制槽（WAL 膨胀） | `pg_replication_slots` | wal_status 不是 'reserved' |
+| 磁盘空间 | OS 监控 | > 80% 告警 |
+| 源库连接数 | `SHOW PROCESSLIST` | > max_connections 80% |
+| 目标库写入速度 | Flink Sink Metrics | 持续下降告警 |
+
+### 场景 22：测试 CDC 管道
+
+**听到这些就命中：**
+> "测试""怎么测试""如何验证""对账""校验""验证数据正确"
+
+```
+CDC 测试分三层：
+1. 连通性测试：源库→CDC→目标库 每个环节都能连
+2. 功能测试：
+   ├─ INSERT 一条 → 目标库出现了吗？
+   ├─ UPDATE 这条 → 目标库更新了吗？值对吗？
+   ├─ DELETE 这条 → 目标库删了吗？
+   └─ 批量写入 1000 条 → 数量对吗？延迟多少？
+3. 压力测试：
+   ├─ 持续写入 1 小时 → 延迟稳定吗？有 OOM 吗？
+   └─ 模拟故障 → 停了 CDC 再恢复，数据对吗？
+```
+
+### 场景 23：容量规划
+
+**听到这些就命中：**
+> "需要多少资源""怎么估算""要多大机器""多少内存""多少 CPU""并发量"
 
 ```yaml
-# 尝试解析影子表事件（实验性）
-'scan.parse.online.schema.changes.enabled' = 'true'
-```
-【官网 §MySQL CDC → 连接器选项 → scan.parse.online.schema.changes.enabled】
+# 经验公式
+CPU 核数 ≈ 源库变更速率（WPS）/ 1000（每核大约处理 1000 events/s）
+内存    ≈ 2GB + (chunk.size × 行大小 × 并行度 × 2)
+磁盘    ≈ checkpoint 保留数 × 状态大小 + 日志预留
+并行度  ≈ server-id 范围 / 2（留余量）
 
-**子分支 E3：MySQL 8.4+ 兼容性**
-
-MySQL 8.4 的破坏性变更：
-- `SHOW MASTER STATUS` → 需改用 `SHOW BINARY LOG STATUS`
-- 术语 `slave/master` → `replica/source`
-- Flink CDC 3.0+ 自动适配，旧版可能报错
-
-**子分支 E4：数据库迁移/主从切换后异常**
-
-| 场景 | 根本原因 | 方案 |
-|------|----------|------|
-| **MySQL 主从切换后数据对不上** | GTID 未开启 | 集群配置 `gtid_mode=on` + `enforce_gtid_consistency=on`【官网 §MySQL CDC → MySQL 高可用性支持】 |
-| **从 CDC 读从库，切换后 binlog 不一致** | 从库未设 `log-slave-updates=1` | 设 `log-slave-updates=1` |
-| **PG 主从切换后复制槽丢失** | 逻辑复制槽不在新主库上 | 在新主库重建复制槽 + 重新 initial |
-| **升级 Flink CDC 版本后无法恢复** | savepoint 格式不兼容 | 无法恢复，只能全量重跑 |
-
-**子分支 E5：数据库字符集/排序规则变更**
-
-→ 如 MySQL 从 `utf8mb3` 改为 `utf8mb4`，CDC 会正常同步新数据
-→ 但旧数据已用 `utf8mb3` 存储，新旧混合可能出现排序或索引问题
-→ 修复：目标表统一字符集后全量重同步
-
-─────────────────────────────────
-#### 分支 F：数据管道完整性
-─────────────────────────────────
-
-**子分支 F1：数据断流——某时间段完全没有数据流入**
-
-→ 检查 CDC 任务是否有重启/暂停事件：
-```sql
--- MySQL 侧检查 binlog 是否有空洞
-SHOW BINARY LOGS;
--- 对比最近几次 checkpoint 的 binlog 文件名
+# 生产最小推荐（中等变更量）
+TaskManager: 4 核 8GB × 2
+并行度: 4
+chunk.size: 32768
+checkpoint 间隔: 60s
 ```
 
-→ 检查心跳：如果 `heartbeat.interval=0s`，低流量表无法感知断流
-→ 修复：设 `heartbeat.interval=30s`；配置 PG 复制槽监控
+---
 
-**子分支 F2：多表间数据不同步**
+## 十、特定工具问题（分类八）
 
-→ CDC FLink 单任务多表时，一张表滞后不影响其他表
-→ 如果多张表需要保持事务一致性（如订单+订单明细），需使用 Flink CDC 的事务对齐机制
-→ 注意：Flink CDC 默认不保证跨表的事务边界一致性，binlog 是行级别的
+> 作为补充，上面所有场景已经覆盖了问题本身，这个分类只处理工具特有的操作差异。
 
-**子分支 F3：Exactly-Once 被破坏**
+### 工具差异速查
 
-→ 可能的原因：
-- `debezium.snapshot.mode=never`（跳过快照，没有基线）
-- `scan.incremental.snapshot.backfill.skip=true`（快照阶段变更被重放，at-least-once）【官网 §MySQL CDC → backfill.skip】
-- 目标库不支持幂等写入（没有 UPSERT 语义）
-- 修复：确保目标表有主键 + UPSERT，关闭 `backfill.skip`
-
-─────────────────────────────────
-
-## 三、龙蜥特殊约定
-
-本技能不涉及 Anolis OS 系统级操作。若排查中需要安装依赖：
-
-- 包管理用 `dnf`（Anolis 23 默认），不用 `yum`
-- Java 环境：`dnf install java-11-openjdk`
-- 服务管理用 `systemctl`
-- 社区反馈：https://forum.openanolis.cn
+| 操作 | Flink CDC | Canal | Debezium | DataX |
+|------|-----------|-------|----------|-------|
+| 启动方式 | Flink run / SQL Client | 独立进程 | Kafka Connect Connector | 命令行 |
+| server-id | 手动指定范围 | 自动 | 自动（Kafka Connect）| 不需要 |
+| DDL 同步 | ⚠️ 有限 | ❌ 不支持 | ✅ Schema Registry | ❌ |
+| 快照 | 增量快照（自动） | 启动时全量 | snapshot.mode 控制 | 全量 |
+| 断点续传 | checkpoint/savepoint | 位点文件 | Kafka offset | 无 |
+| 配置格式 | DDL / YAML | properties 文件 | JSON connector config | JSON |
+| 挂载驱动 | MySQL/Oracle 手动 | 无 | 无 | 无 |
+| 监控 | Flink WebUI | 自定义 | Kafka Connect REST API | 日志 |
 
 ---
 
 ## 四、易错点
 
-1. **CDC 日志正常 ≠ 数据正确**：乱序覆盖时 CDC 是正常的，问题在目标库写入顺序
-2. **时区只转一次不够**：源库、业务代码、数仓可能三个时区
+1. **日志正常 ≠ 数据正确**：乱序覆盖时所有日志正常，问题在目标库写入顺序
+2. **时区只转一次不够**：源库时区、业务代码时区、数仓时区可能三个都不一样
 3. **增量窗口卡太紧**：不加缓冲一定漏边界数据
 4. **同时设 `scan.startup.mode` 和 `debezium.snapshot.mode`**：两者冲突，前者失效【官网 §Db2 CDC → 启动模式】
 5. **非主键列做 chunk key**：官方明确警告可能数据不一致【官网 §MySQL CDC → chunk.key-column】
-6. **`backfill.skip=true`**：仅 at-least-once，快照阶段变更可能被重放【官网 §MySQL CDC → backfill.skip】
-7. **PG 复制槽不清理**：CDC 停掉后 WAL 会膨胀到磁盘满
-8. **MongoDB 不设心跳**：慢变更表 resumeToken 过期，恢复失败
-9. **MySQL 8.4 用旧版 CDC**：`SHOW MASTER STATUS` 已弃用，CDC 2.x 不兼容 8.4
-10. **无视版本映射表**：Flink CDC 3.x JAR 不能在 Flink 1.13 上跑
-11. **Schema Evolution 无脑开**：字段改名丢数据、类型缩窄写失败，必须配合监控
-12. **Flink SQL 模式期待自动 DDL**：Flink SQL 模式不支持自动 DDL，必须手动改 DDL 重启
+6. **PG 复制槽不清理**：CDC 停掉后 WAL 会膨胀到磁盘满
+7. **MongoDB 不设心跳**：慢变更表 resumeToken 过期，恢复失败
+8. **MySQL 8.4 用旧版 CDC**：`SHOW MASTER STATUS` 已弃用，CDC 2.x 不兼容
+9. **无视版本映射表**：Flink CDC 3.x JAR 不能在 Flink 1.13 上跑
+10. **Schema Evolution 无脑开**：字段改名丢数据、类型缩窄写失败
+11. **Flink SQL 模式期待自动 DDL**：Flink SQL 不支持自动 DDL
+12. **任务重启只恢复数据不恢复 DDL**：加字段后重启 task 不会自动加字段，必须改 DDL 定义
+13. **CDC 不是备份**：CDC 是复制不是备份，源库数据被删目标库也会被删（开了 DELETE 同步的话）
+14. **Binlog 不是永久存储**：默认只保留几天，CDC 停了太久就恢复不了
 
 ---
 
 ## 五、验证
 
-修复后逐项确认：
-
 | # | 检查项 | 方法 | 通过标准 |
 |---|--------|------|----------|
-| 1 | 任务运行 | Flink WebUI | RUNNING，无 FAILED |
-| 2 | Checkpoint | Flink WebUI | 最近 ≥ 3 个成功 |
+| 1 | 任务运行 | Flink WebUI / 进程列表 | RUNNING |
+| 2 | Checkpoint | Flink WebUI | 最近 3 个成功 |
 | 3 | 数据量 | `COUNT(*)` 对比两端 | 差值 < 0.1% |
-| 4 | 数据值 | 任取 10 条逐字段对比 | 完全一致 |
-| 5 | 乱序修复 | 手动模拟后到先写（先发新值后发旧值） | 目标库保留最新值 |
-| 6 | 延迟 | Flink Metrics | 稳定在业务容忍范围内 |
-| 7 | 稳定性 | 观察 30 分钟 | 无异常断开或报错 |
-| 8 | 断流检测 | 检查心跳事件是否持续 | `heartbeat.interval` 内有数据流动 |
+| 4 | 数据值 | 取 10 条逐字段对比 | 完全一致 |
+| 5 | 乱序修复 | 手动模拟后到先写 | 目标库保留最新值 |
+| 6 | 延迟 | Flink Metrics / 自定义监控 | 稳定在容忍范围内 |
+| 7 | 稳定性 | 观察 30 分钟 | 无异常 |
+| 8 | 断流检测 | 心跳事件持续 | 无空洞 |
 
 ---
 
@@ -414,34 +623,47 @@ SHOW BINARY LOGS;
 
 **用户：** "今天业务库 10000 单，数仓只查到 7000 单。"
 
-**Agent 执行：** 分支 A → A1 → 按小时对比 → 发现凌晨 2-5 点缺失 → 检查时区 → 源库 UTC-5，数仓 UTC+8 → 增量窗口前后各加 1h → 验证次日对账对齐
+**Agent 执行：** 分类一 → 场景 1 → Step 2（少了） → 按小时对比 → 发现凌晨 2-5 点缺失 → 检查时区 → 源库 UTC-5，数仓 UTC+8 → 增量窗口前后各加 1h → 次日验证对齐
 
 ### 示例 2：CDC 数据乱序
 
-**用户：** "订单已支付→已发货→已完成，查 Doris 还是已支付。CDC 和 Flink 日志正常。"
+**用户：** "订单状态回退了，日志都正常，但 Doris 数据是旧的。"
 
-**Agent 执行：** 分支 B → B1 → 确认 CDC/Flink 日志正常 → 检查 Doris Sequence Column → 未启用 → 启用 ALTER TABLE ENABLE FEATURE "SEQUENCE_LOAD" → 验证乱序写入后保留最新值
+**Agent 执行：** 分类一 → 场景 2（值不对） → 最终值回退 → 检查 Sequence Column → 未启用 → 启用 → 验证
 
-### 示例 3：任务启动报错
+### 示例 3：任务起不来
 
-**用户：** "Flink CDC 任务起不来。"
+**用户：** "Flink CDC 任务启动就报错，日志说 binlog 什么的。"
 
-**Agent 执行：** 分支 C → C1 → 从错误表第一行开始问用户 → `SHOW VARIABLES LIKE 'log_bin'` → OFF → 开启 binlog → 确认 binlog_format=ROW → 任务启动成功
+**Agent 执行：** 分类二 → 场景 6（启动报错） → 表找 binlog → `SHOW VARIABLES LIKE 'log_bin'` → OFF → 开启 binlog + binlog_format=ROW → 重启 MySQL → 启动成功
 
-### 示例 4：恢复失败——binlog 被清理
+### 示例 4：改表后不行了
 
-**用户：** "CDC 任务停了一周，恢复时报错找不到 binlog。"
+**用户：** "源表加了个字段，但目标库一直没出现。"
 
-**Agent 执行：** 分支 C → C3 → 执行 `SHOW BINARY LOGS` → binlog 只保留了 3 天 → checkpoint 记录的文件已不存在 → 用户选 latest-offset → 接受丢 4 天数据 → 完成
+**Agent 执行：** 分类四 → 场景 14 → Flink SQL 模式不支持自动 DDL → 手动改 DDL → savepoint 重启
 
-### 示例 5：延迟越来越高
+### 示例 5：延迟高
 
-**用户：** "CDC 任务跑了一周，现在延迟达到 2 小时了。"
+**用户：** "延迟越来越高了，现在差 2 小时了。"
 
-**Agent 执行：** 分支 D → D1 → Flink WebUI 看背压 → Sink HIGH → Doris 写入慢 → 增大并行度 + server-id 范围 → 增大 checkpoint 间隔 → 延迟逐步追上
+**Agent 执行：** 分类三 → 场景 11 → Flink WebUI 看 → Sink HIGH → Doris 写入慢 → 增大并行度 + 增大 checkpoint 间隔
+
+### 示例 6：迁移后数据不对
+
+**用户：** "数据库从 5.7 升到 8.0 后，CDC 数据对不上了。"
+
+**Agent 执行：** 分类五 → 场景 17 → MySQL 8.0 默认 `binlog_format` 变化？→ `SHOW VARIABLES LIKE 'binlog_format'` → `MIXED` 不是 `ROW` → 设为 `ROW` → 重启
+
+### 示例 7：第一次搭 CDC
+
+**用户：** "第一次用 Flink CDC 同步 MySQL 到 Doris，不知道怎么配。"
+
+**Agent 执行：** 分类六 → 场景 19 → 给出最小配置示例 + 生产推荐参数 + 验证步骤
 
 ---
 
 ## 参考文档
 
-所有连接器官方文档索引：https://nightlies.apache.org/flink/flink-cdc-docs-master/zh/docs/connectors/flink-sources/overview/
+- Flink CDC 官方文档：https://nightlies.apache.org/flink/flink-cdc-docs-master/zh/docs/connectors/flink-sources/overview/
+- Debezium 文档：https://debezium.io/documentation/reference/stable/
