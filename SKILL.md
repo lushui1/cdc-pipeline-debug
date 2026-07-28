@@ -1,6 +1,6 @@
 ---
 name: cdc-pipeline-debug
-description: 诊断与修复 CDC 增量同步/实时数据管道中的各类数据一致性问题。当用户说"数据对不上""增量同步少了""CDC丢数据""同步延迟""时区导致数据错位""DELETE未捕获""Sequence Column""数据乱序""整库同步配置""Flink CDC""binlog""server-id""GTID""增量快照""checkpoint超时""心跳事件""schema evolution""动态加表""LogMiner""slot.name""LSN""数据类型映射""精度丢失""debezium""快照分片""无主键表""复制槽膨胀""WAL"时立刻触发。即使用户只说"实时数据不准""业务库和数仓对不上""任务启动失败""快照读超时""flink任务重启报错"而上下文是数据管道/ETL/实时数仓，也应该触发。涵盖 Flink CDC 全系列连接器（MySQL、Oracle、PostgreSQL、MongoDB、SQL Server、TiDB、OceanBase、Db2、Vitess）及 DataX、Canal、Debezium 等工具的深度排障。基于 Apache Flink CDC 官方文档体系构建。
+description: CDC 数据管道症状排查手册。从现象反向定位根因。当用户描述以下任何现象时立即触发：数据量对不上、数据值不对、最终值回退、同步延迟、数据重复、精度丢失、乱码、时区差、任务启动失败、运行中断、恢复失败、OOM、加字段没同步、改类型写入失败、删表重建、扩容后异常、改密码报错、迁移集群后起不来、主从切换后异常。无论用户用何种 CDC 工具（Flink CDC / Canal / Debezium / DataX / Kafka Connect），也无论源库或目标库类型，只要现象匹配就介入排查。
 version: 1.0.0
 author: open-anolis
 os_support:
@@ -8,722 +8,913 @@ os_support:
 tags:
   - 数据中间件
   - CDC
+  - 故障排查
   - Flink CDC
-  - 增量同步
-  - 实时数仓
-  - ETL
   - Debezium
 suggested_sig: middleware
 contributor_type: personal
 ---
 
-# CDC Pipeline Debug / CDC 增量同步管道排障
+# CDC 管道故障排查手册 / CDC Pipeline Symptom Diagnosis
 
-诊断与修复 CDC 增量同步/实时数据管道中的各类数据一致性问题。基于 [Apache Flink CDC](https://nightlies.apache.org/flink/flink-cdc-docs-master/) 官方文档体系构建，涵盖全部 9 个连接器及 Debezium 引擎层。
+**用法：** 用户描述现象 → 在下面找到匹配的症状章节 → 逐一排查可能原因 → 直到定位根因。
 
----
-
-## 一、前置条件与版本兼容性
-
-排查前先确认以下信息，减少空转：
-
-1. **同步工具与版本**：Flink CDC（精确版本？）、DataX、Canal、Debezium
-2. **源库类型与版本**：MySQL 5.7/8.0/8.4+、Oracle 11/12/19/21、PostgreSQL 9.6-14、MongoDB 3.6-7.0、SQL Server 2012-2019、TiDB 5.1-6.0、OceanBase 3.x/4.x、Db2 11.5、Vitess 8.0+/9.0+
-3. **目标库类型**：Doris / Paimon / ClickHouse / Kafka / Elasticsearch / Hive
-4. **同步模式**：增量同步 / 全量+增量（snapshot + CDC） / CDC 实时流
-5. **问题特征**：数据少了 / 数据重复 / 数据错位 / 延迟高 / 任务启动失败 / 快照读超时 / checkpoint 超时 / 连接断开 / 数据类型转换错误 / OOM
-
-### Flink CDC ↔ Flink 版本映射
-
-**先确认版本兼容性**——版本不匹配是很多"莫名其妙"问题的根因：
-
-| Flink CDC 版本 | 兼容 Flink 版本 | 关键变化 |
-|---------------|----------------|----------|
-| 3.6.* | 1.20.*, 2.2.* | 最新稳定 |
-| 3.5.* | 1.19.*, 1.20.* | |
-| 3.4.* | 1.19.*, 1.20.* | |
-| 3.3.* | 1.18.*, 1.19.*, 1.20.*, 2.1.* | YAML Pipeline 正式可用 |
-| 3.2.* | 1.17.*, 1.18.*, 1.19.*, 1.20.* | |
-| 3.0.* | 1.14.*, 1.15.*, 1.16.*, 1.17.*, 1.18.* | 增量快照、动态加表 |
-| 2.4.* | 1.13.*, 1.14.*, 1.15.*, 1.16.*, 1.17.* | |
-| 2.3.* | 1.13.*, 1.14.*, 1.15.*, 1.16.* | |
-
-> ⚠️ 用错版本会直接导致运行时类加载异常或语义不一致。例如 Flink CDC 3.0+ 的增量快照在 Flink 1.13 上无法使用。
-
-### 连接器特性矩阵
-
-不同连接器的能力差异很大，先确认当前连接器的能力边界，避免猜测不存在的特性：
-
-| 连接器 | 无锁读 | 并行读快照 | Exactly-Once | 增量快照 | 动态加表 | 支持无主键表 |
-|--------|--------|-----------|-------------|---------|---------|------------|
-| **MySQL CDC** | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| **Oracle CDC** | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
-| **PostgreSQL CDC** | ✅ | ⚠️ 实验性 | ✅ | ⚠️ 默认关闭 | ❌ | ❌ |
-| **MongoDB CDC** | ✅ (Change Stream) | ❌ | ✅ | ⚠️ 需 4.0+ | ✅ (3.1.0+) | N/A |
-| **SQL Server CDC** | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
-| **TiDB CDC** | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
-| **OceanBase CDC** | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| **Db2 CDC** | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ (3.4.0+) |
-| **Vitess CDC** | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ |
+每条症状包含：**现象描述 → 可能原因列表 → 对每个原因：反向定位 → 确认方法 → 修复 → 验证**
 
 ---
 
-## 二、任务启动失败排查
+## 症状 1：数据量不一致——数仓记录数比业务库少
 
-### A1 连接失败 / 权限不足 / binlog 未开启
+用户发现目标库（数仓/数据湖）中某张表的记录数少于源业务库，出现了"漏数据"。
 
-**MySQL CDC 前置检查清单：**
+### 可能原因
 
-```sql
--- 检查 binlog（必须 ON）
-SHOW VARIABLES LIKE 'log_bin';
--- 检查 binlog 格式（必须 ROW）
-SHOW VARIABLES LIKE 'binlog_format';
--- 检查 binlog 保留天数
-SHOW VARIABLES LIKE 'binlog_expire_logs_seconds';
--- 检查 GTID（高可用推荐开启）
-SHOW VARIABLES LIKE 'gtid_mode';
--- 检查连接超时设置
-SHOW VARIABLES LIKE 'wait_timeout';
-SHOW VARIABLES LIKE 'interactive_timeout';
-```
+#### 原因 1.1：增量时间窗口的时区不对，边界数据被切到前/后一个分区
 
-CDC 账号最小权限：
+**反向定位：** 按小时对比源库和目标库的数据量曲线，看看是否是凌晨/边界整点时刻的数据缺失。
+
+**确认方法：**
 
 ```sql
--- 增量快照模式（默认开启）不需要 RELOAD 权限
-CREATE USER 'cdc'@'%' IDENTIFIED BY 'password';
-GRANT SELECT, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'cdc'@'%';
-FLUSH PRIVILEGES;
+-- 源库：按小时统计最近 48 小时的数据量
+SELECT DATE_FORMAT(create_time, '%Y-%m-%d %H:00:00') AS hour_slot,
+       COUNT(*) AS cnt
+FROM source_table
+WHERE create_time >= NOW() - INTERVAL 48 HOUR
+GROUP BY DATE_FORMAT(create_time, '%Y-%m-%d %H:00:00')
+ORDER BY hour_slot;
+
+-- 目标库同样的统计，对比差异
+-- 如果每天固定某个小时（通常是凌晨 0-4 点）的数据量差异最大 → 时区问题
 ```
 
-**各数据库 CDC 前置条件速查：**
-
-| 条件 | MySQL | Oracle | PostgreSQL | MongoDB | SQL Server |
-|------|-------|--------|------------|---------|------------|
-| 日志模式 | `binlog_format=ROW` | `ARCHIVELOG` + `SUPPLEMENTAL LOG` | `wal_level=logical` | 需副本集/分片集群 | 需启用 CDC |
-| 额外组件 | MySQL Connector 需手动添加（GPL 协议不兼容） | Oracle JDBC、xdb 需手动添加 | 无 | 无 | 需 SQL Server Agent 运行 |
-| 关键权限 | `REPLICATION SLAVE`, `REPLICATION CLIENT` | `LOGMINING`, `SELECT ANY TRANSACTION` | `REPLICATION` 角色 | `changeStream`, `read` | `db_owner` |
-| 特殊约束 | 无 | CDB 模式下需配置 `debezium.database.pdb.name` | `slot.name` 需小写字母+数字+下划线 | 需 WiredTiger 引擎、pv1 协议 | 需逐表 `sys.sp_cdc_enable_table` |
-| 连接器协议不兼容 | ❌ MySQL Connector (GPLv2) | ❌ Oracle JDBC (FUTC) | ✅ 内置 | ✅ 内置 | ✅ 内置 |
-
-**Oracle CDC 数据库级配置：**
-
-```sql
--- 1. 开启归档模式（需要重启）
-SHUTDOWN IMMEDIATE;
-STARTUP MOUNT;
-ALTER DATABASE ARCHIVELOG;
-ALTER DATABASE OPEN;
-
--- 2. 开启 Supplemental Logging
-ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;
-
--- 3. 表级补充日志（可选）
-ALTER TABLE mytable ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;
+**修复：**
+```
+修改增量切分时间窗口，前后各加 1 小时缓冲：
+  原逻辑：modified_time >= T-1 00:00 AND modified_time < T 00:00
+  改后：  modified_time >= T-1 00:00 - 1h AND modified_time < T 00:00 + 1h
+少量重复由下游去重层处理。
 ```
 
-**PostgreSQL CDC 配置：**
-
-```ini
-# postgresql.conf 必须配置
-wal_level = logical
-max_replication_slots = 10    # 至少 1
-max_wal_senders = 10          # 至少 1
-```
-
-### A2 server-id 冲突（MySQL / OceanBase）
-
-每个读 binlog 的客户端必须有唯一 server-id。多个 CDC 任务连接同一 MySQL 实例时必须用范围分配。
-
-**排查命令：**
-```sql
-SHOW PROCESSLIST;
--- 查看所有连接的 server-id
-```
-
-**最佳实践：**
-
-```sql
--- 并行度 = 4，server-id 范围 = 5401-5404
-'server-id' = '5401-5404'
--- 范围大小必须 ≥ 并行度
-```
-
-默认连接器会在 5400-6400 之间随机生成，但显式指定更可靠。
-
-### A3 大表快照读 checkpoint 超时
-
-**触发条件：** 大表全量快照阶段，数据库连接超时或 checkpoint 超时导致 failover。
-
-**适用连接器：** Oracle CDC、SQL Server CDC（增量快照关闭时）、PostgreSQL CDC（增量快照关闭时）
-
-```sql
--- 必须为这些大表配置宽松的 checkpoint 策略
-SET 'execution.checkpointing.interval' = '10min';
-SET 'execution.checkpointing.tolerable-failed-checkpoints' = '100';
-SET 'restart-strategy' = 'fixed-delay';
-SET 'restart-strategy.fixed-delay.attempts' = '2147483647';
-```
-
-**MySQL 大表快照需额外配置 MySQL 连接超时：**
-
-```ini
-# my.cnf
-interactive_timeout = 86400     # 24 小时
-wait_timeout = 86400
-```
-
-### A4 Vitess 特殊配置
-
-Vitess CDC 通过 VTGate gRPC 读取变更，不直接连 MySQL：
-
-- 需确保 VTGate host 和 gRPC 端口（默认 15991）可达
-- 目前仅支持无认证的 gRPC 访问
-- `tablet.type` 控制从哪个 MySQL 实例读：`MASTER` / `REPLICA` / `RDONLY`
-- 不包含快照功能，只支持增量读取
+**验证：** 次日同一时段对比差值消失。
 
 ---
 
-## 三、增量同步数据量对不上（离线增量类）
+#### 原因 1.2：增量切分字段是业务写入的时间戳，本身有空洞或时区混乱
 
-**典型症状：** 业务库和数仓同一张表对账，记录数不一致。
+**反向定位：** 源表中存在 `modified_time` 为 NULL、为未来时间、或明显偏离业务时间范围的记录。
 
-### 排查步骤
+**确认方法：**
 
-| 步骤 | 操作 | 判断依据 |
-|------|------|----------|
-| 1. 按时间窗口对账 | 按小时/天分区对比两边记录数 | 如果凌晨边界数据缺失 → 时区问题 |
-| 2. 检查时区链 | 源库时区 ↔ 业务代码时区 ↔ 数仓分区时区 | 三个时区不一定相同，转一次不够 |
-| 3. 检查物理删除 | 对比全量主键集合，找"数仓有、业务库无"的记录 | Flink CDC 的 changelog 包含 `-D`，DataX 类不处理 DELETE |
-| 4. 检查增量字段 | `modified_time` 是数据库自动维护的还是业务写入的 | 业务写入的时间戳可能有时区混乱、空值、未来时间 |
+```sql
+-- 检查增量字段是否可靠
+SELECT 
+  COUNT(*) AS total,
+  SUM(CASE WHEN modified_time IS NULL THEN 1 ELSE 0 END) AS null_count,
+  SUM(CASE WHEN modified_time > NOW() THEN 1 ELSE 0 END) AS future_count,
+  MIN(modified_time) AS earliest,
+  MAX(modified_time) AS latest
+FROM source_table;
+```
 
-### 解决方案
+如果发现 NULL 或未来时间戳，说明增量字段本身不可靠。
 
-| 根因 | 修复方案 |
-|------|----------|
-| 时区不一致 | 增量时间窗口前后各留缓冲（如 1 小时），下游做去重 |
-| 物理删除未捕获 | 推业务改逻辑删除；或 binlog 监听 DELETE；或 `scan.read-changelog-as-append-only` + `row_kind` |
-| 增量字段不可靠 | 改用 binlog 位点做增量切分 |
+**修复：**
+```
+改用数据库自动维护的修改时间戳（如果有），或者用 binlog 位点做增量切分。
+如果是 DataX 类工具，改用主键自增 ID 范围切分。
+```
+
+**验证：** 使用新切分方式重新跑一次增量同步，对比差值。
 
 ---
 
-## 四、CDC 实时数据不一致（核心排障）
+#### 原因 1.3：源表存在物理 DELETE，增量同步只捕获了 INSERT/UPDATE
 
-### 场景 B1：乱序覆盖——表象正常但数据不对
+**反向定位：** 目标库中存在源库已经找不到的记录（数仓多出来的旧数据）。
 
-**典型症状：** CDC 日志 ✅ → 计算引擎日志 ✅ → 目标库日志 ✅ → 但最终值是旧的。
+**确认方法：**
 
-**根因：** 目标库使用 last-write-wins 语义（Doris Unique Key、Paimon LSM-Tree），CDC 管道并行处理后写入顺序被打乱。
-
-#### CDC 四层排查法（必记）
-
-```
-问题现象 → 逐层定位 → 根因修复
-```
-
-| 特征 | 问题层 | 排查方法 |
-|------|--------|----------|
-| 任务启动就失败 | 源库层 | binlog/归档/WAL 开启？用户权限？SSL？ |
-| 任务偶尔断开 | 网络层 | `wait_timeout` / `interactive_timeout` / keepalive / 跨机房延迟 |
-| 处理时报错 | 计算引擎层 | Flink SQL 语法兼容性？并行度设置？checkpoint 配置？ |
-| **一切正常但数据不对** | **存储引擎层 ⚠️** | **逐条对比源库和目标库，这是最难排查的一层** |
-
-#### Sequence Column 选择指南
-
-| 粒度 | 适用场景 | 风险 |
-|------|----------|------|
-| 秒级 update_time | 业务变更频率 < 1次/秒 | 同秒多次变更区分不了 |
-| 毫秒级时间戳 | 高频变更场景 | 需源库支持毫秒精度 |
-| 自增版本号 | 最严格的正确性要求 | 业务代码需维护版本号 |
-
-**Doris SQL：**
 ```sql
-ALTER TABLE orders ENABLE FEATURE "SEQUENCE_LOAD"
-WITH PROPERTIES ("function_column.sequence_type" = "DATETIME");
+-- 在主键维度上做差集：数仓有但业务库无 = 被物理删除的残留
+SELECT COUNT(*) AS ghost_records
+FROM (
+  SELECT target.id FROM target_table target
+  LEFT JOIN source_table source ON target.id = source.id
+  WHERE source.id IS NULL
+) t;
 ```
 
-**验证 Sequence Column 是否启用：**
+如果 `ghost_records` > 0，说明业务存在物理删除，增量同步未捕获 DELETE 事件。
+
+**修复：**
+```
+方案一（推荐）：让业务改为逻辑删除（加 is_deleted 字段，DELETE → UPDATE SET is_deleted=1）
+方案二（实时场景）：启用 CDC 的 binlog 监听，捕获 DELETE 事件写入删除日志表
+方案三（兜底）：每日全量对比主键，标记被删除的记录
+```
+
+**验证：** 修复后再跑一次差集查询，`ghost_records` 不再增长。
+
+---
+
+#### 原因 1.4：快照阶段的分片键列被并发更新，导致部分行被遗漏
+
+**反向定位：** 检查表的分片键（chunk key）是否为主键列。如果不是，检查该列在快照期间是否有被更新。
+
+**确认方法：**
+
+```sql
+-- 检查表的 chunk key 配置
+-- MySQL CDC：scan.incremental.snapshot.chunk.key-column
+-- 如果未显式配置，默认是主键第一列
+
+-- 检查分片列是否有 update 操作
+SELECT COUNT(*) FROM source_table
+WHERE chunk_key_column != COALESCE(
+  (SELECT chunk_key_column FROM source_table_history WHERE ...), chunk_key_column
+);
+```
+
+如果配了非主键列作为 chunk key，**这本身就可能造成数据遗漏或重复**。
+
+**修复：**
+```
+将 scan.incremental.snapshot.chunk.key-column 改为主键第一列（默认值）。
+如果表没有主键，尝试加一个自增 ID 作为主键。
+```
+
+**验证：** 重新做一次全量快照，对比主键集合是否一致。
+
+---
+
+## 症状 2：数据量不一致——数仓记录数比业务库多
+
+用户发现目标库比源库多了记录，出现了"幽灵数据"。
+
+### 可能原因
+
+#### 原因 2.1：业务有物理 DELETE，但增量同步未捕获（同 1.3）
+
+参见症状 1 的 原因 1.3。
+
+---
+
+#### 原因 2.2：增量时间窗口缓冲过大，产生重复记录
+
+**反向定位：** 检查最近几天的增量同步是否存在边界重复——同一条记录的主键在目标库出现两次以上。
+
+**确认方法：**
+
+```sql
+-- 检查目标库主键是否重复
+SELECT id, COUNT(*) AS dup_count
+FROM target_table
+GROUP BY id
+HAVING COUNT(*) > 1
+ORDER BY dup_count DESC
+LIMIT 10;
+```
+
+**修复：**
+```
+在 DWD 层或目标表上做幂等写入（UPSERT 语义），以最新时间戳为准。
+如果是 DataX 类不支持 UPSERT 的工具，在写入前做一次去重。
+```
+
+**验证：** 再次检查主键重复数为 0。
+
+---
+
+#### 原因 2.3：快照阶段与增量阶段的数据重叠
+
+**反向定位：** 任务刚启动时，快照阶段的数据和随后开始的增量阶段数据有重叠。
+
+**确认方法：** 检查任务启动时间附近的数据是否存在整批重复——同一条记录在快照阶段和增量阶段各被消费了一次。
+
+**修复：**
+```
+Flink CDC 增量快照算法本身保证不重叠（全量完成后等一个完整 checkpoint 才开启 binlog 消费）。
+如果出现重叠，检查是否手动修改过 scan.startup.mode 或 debezium.snapshot.mode。
+确保不要同时设置 scan.startup.mode 和 debezium.snapshot.mode，两者会冲突。
+```
+
+**验证：** 从 savepoint 重启任务后检查。
+
+---
+
+## 症状 3：数据值不对——最终值不是最新值
+
+CDC 日志正常、计算引擎日志正常、目标库日志正常，但目标库中的最终值是旧值，仿佛变更"回退"了。
+
+### 可能原因
+
+#### 原因 3.1：目标库使用"后写入覆盖"语义，CDC 管道内发生乱序
+
+**这是 CDC 管道最隐蔽的问题。** 同一条记录的多次变更在毫秒级到达，并行处理后写入顺序被打乱——后发生的变更先入库，先发生的变更后入库，旧值覆盖了新值。
+
+**反向定位：** 任取一条问题记录，在源库查完整的变更时间线，在目标库查最终值，对比。
+
+**确认方法：**
+
+```sql
+-- 源库：查该记录的所有变更（依赖 binlog 或操作日志）
+-- 目标库：查该记录的最终值
+-- 如果目标库的最终值 = 源库的某个中间值（不是最新值）= 乱序覆盖
+```
+
+**修复：**
+```
+为目标表启用 Sequence Column（顺序列），用业务时间戳或自增版本号作为排序依据。
+Doris 示例：
+  ALTER TABLE orders ENABLE FEATURE "SEQUENCE_LOAD"
+  WITH PROPERTIES ("function_column.sequence_type" = "DATETIME");
+Paimon：检查主键定义和 LSM-Tree 的合并顺序。
+```
+
+**确认 Sequence Column 已生效：**
 ```sql
 SET show_hidden_columns = true;
 DESC orders;
--- 输出应包含 __DORIS_SEQUENCE_COL__
+-- 输出应包含 __DORIS_SEQUENCE_COL__ 列
 ```
 
-### 场景 B2：增量快照算法原理与参数调优
-
-MySQL CDC 增量快照（incremental snapshot）是 3.0+ 的核心特性，理解其工作原理对排障至关重要：
-
-```
-启动 → 表按 chunk key 分片 → 多个 reader 并行读 chunk → 
-每个 chunk 完成后做 checkpoint → 全量完成 → 
-单个 task 读 binlog（等一个完整 checkpoint 后开始以确保顺序）
-```
-
-**核心参数：**
-
-| 参数 | 默认值 | 说明 | 调优场景 |
-|------|--------|------|----------|
-| `scan.incremental.snapshot.chunk.size` | 8096 行 | 每个分片的行数 | 大表调大（减少分片数），小表调小（减少空转） |
-| `scan.snapshot.fetch.size` | 1024 | 每次拉取的最大行数 | 大字段表调大 |
-| `scan.incremental.snapshot.chunk.key-column` | 主键第一列 | 分片键 | **非主键列做 chunk key 可能导致数据不一致！见下方警告** |
-| `scan.incremental.snapshot.backfill.skip` | false | 是否跳过 backfill | **开启后仅保证 at-least-once，快照阶段变更可能被重放** |
-| `scan.incremental.snapshot.unbounded-chunk-first.enabled` | true | 先分配 unbounded chunk | 降低 OOM 风险 |
-| `scan.incremental.close-idle-reader.enabled` | false | 快照结束后关闭空闲 reader | 减少资源占用，需 Flink ≥ 1.14 |
-
-**⚠️ 非主键列作为 chunk key 的数据不一致风险：**
-
-当分片键列在快照期间被更新时，同一行记录可能：
-1. 被多个分片同时读到（重复）
-2. 被遗漏（不在任何分片中）
-
-**示例场景：**
-```
-表：id(PK), pid(chunk key)
-分片0: 1 < pid <= 3
-分片1: 3 < pid <= 5
-
-并发读取时，id=0 的 pid 从 2→4 更新
-分片0 读到 [id=0, pid=2]
-分片1 读到 [id=0, pid=4]
-最终值不确定 → 数据不一致
-```
-
-**💡 最佳实践：始终用主键列做 chunk key，除非表无主键且你清楚风险。**
-
-### 场景 B3：MySQL 启动模式详解
-
-启动模式决定 CDC 从什么位点开始消费。选错会导致数据缺失或重复。
-
-| 模式 | 行为 | 适用场景 |
-|------|------|----------|
-| `initial`（默认） | 全量快照 + 增量 binlog | 新建同步作业 |
-| `latest-offset` | 只从当前最新位点开始，不读快照 | 只关心未来的变更 |
-| `earliest-offset` | 从最早可用 binlog 开始 | 需要全历史变更 |
-| `specific-offset` | 从指定 binlog 文件名+位置开始 | 恢复场景（从已知正确位点重放） |
-| `timestamp` | 从指定时间戳开始 | 按时间回溯 |
-| `snapshot` | 只读快照，不读 binlog | 一次性全量抽取 |
-
-**恢复场景示例：**
-
-```sql
--- 从指定 binlog 位点恢复
-'scan.startup.mode' = 'specific-offset',
-'scan.startup.specific-offset.file' = 'mysql-bin.000123',
-'scan.startup.specific-offset.pos' = '456789'
-```
-
-### 场景 B4：Heartbeat 与 binlog 清理
-
-**问题：** 慢变更表的 binlog 位置长时间不更新，binlog 文件被清理后 CDC 恢复失败。
-
-```sql
--- ⚠️ 启用心跳事件（默认 30s），持续推动 binlog 位置
-'heartbeat.interval' = '30s'
-
--- ❌ 不推荐禁用
-'heartbeat.interval' = '0s'
-```
-
-### 场景 B5：PostgreSQL 复制槽管理
-
-**⚠️ 这是 PostgreSQL CDC 排障中最常见的问题。**
-
-```
-PostgreSQL CDC 原理：
-逻辑复制槽 → 追踪 WAL 消费位点 → 阻止 WAL 被清理
-```
-
-**排障清单：**
-
-| 问题 | 排查方法 | 解决方案 |
-|------|----------|----------|
-| 复制槽膨胀 | `SELECT * FROM pg_replication_slots;` 检查 `wal_status` | 清理不再使用的槽：`SELECT pg_drop_replication_slot('flink');` |
-| WAL 磁盘满 | 复制槽未释放 → WAL 堆积 → 磁盘占满 | 删除无用槽后 VACUUM |
-| slot 名冲突 | 同一 PostgreSQL 实例多个 CDC 作业 | 每个作业用不同的 `slot.name` |
-| LSN 恢复 | `scan.lsn-commit.checkpoints-num-delay` | 默认延迟 3 个 checkpoint 再提交 LSN |
-
-```sql
--- 查看所有复制槽
-SELECT slot_name, slot_type, database, wal_status, active
-FROM pg_replication_slots;
-
--- 手动删除（确认任务已停）
-SELECT pg_drop_replication_slot('flink');
-```
-
-**PostgreSQL CDC 其他关键参数：**
-
-```yaml
-# 变更日志模式
-'changelog-mode' = 'all'    # 标准 retract 流 (INSERT/DELETE/UPDATE_BEFORE/UPDATE_AFTER)
-'changelog-mode' = 'upsert' # 幂等更新流，用于无 REPLICA IDENTITY FULL 的表
-
-# 解码插件
-'decoding.plugin.name' = 'decoderbufs'       # 默认，需 protobuf
-'decoding.plugin.name' = 'wal2json'          # JSON 格式输出
-'decoding.plugin.name' = 'pgoutput'          # PostgreSQL 原生插件
-```
-
-### 场景 B6：MongoDB CDC 特殊排障
-
-**核心技术差异：** MongoDB CDC 使用 **Change Stream**（3.6+）而非 oplog，差异巨大。
-
-| 维度 | Change Stream（MongoDB CDC 使用） | Oplog（Debezium MongoDB 使用） |
-|------|----------------------------------|-------------------------------|
-| 全文档查找 | ✅ 每次更新返回完整文档 | ❌ 需要手动 lookup |
-| 版本兼容 | MongoDB 3.6+ | MongoDB 5+ 格式变更 |
-| 协议版本 | 需要 pv1 | 不受限 |
-
-**MongoDB 排障要点：**
-
-```yaml
-# 1. ⚠️ 慢变更集合必须设心跳（防止 resumeToken 过期）
-'heartbeat.interval.ms' = '300000'
-
-# 2. 快照数据筛选（下推到 MongoDB，提高效率）
-'initial.snapshotting.pipeline' = '[ { "$match": { "status": "active" } } ]'
-
-# 3. 增量快照（实验性，MongoDB 4.0+）
-'scan.incremental.snapshot.enabled' = 'true'
-
-# 4. 启动模式
-'scan.startup.mode' = 'initial'         # 全量+增量
-'scan.startup.mode' = 'latest-offset'   # 只从当前开始
-'scan.startup.mode' = 'timestamp'       # 从指定时间戳开始
-'scan.startup.timestamp-millis' = '1667232000000'
-```
-
-**MongoDB 动态加表（3.1.0+）：**
-```
-1. savepoint 停止作业
-2. 更新 collectionList() 添加新集合
-3. 从 savepoint 恢复
-→ 新集合自动读快照 + 变更流
-```
-
-### 场景 B7：Db2 无主键表支持（3.4.0+）
-
-无主键表的 CDC 需要格外注意：
-
-```yaml
-# 必须指定 chunk key（非 null 列）
-'scan.incremental.snapshot.chunk.key-column' = 'non_null_col'
-
-# 如果 chunk key 列不被更新 → exactly-once
-# 如果 chunk key 列被更新 → at-least-once
-# 💡 下游做幂等去重来保证最终一致性
-```
-
-**建议：** 优先用索引列作为 chunk key 以提高查询性能。
-
-### 场景 B8：CDC YAML Pipeline 整库同步
-
-Flink CDC 3.0+ 的 YAML Pipeline 模式用于多表整库同步，但有几个常见配置陷阱：
-
-```yaml
-source:
-  type: mysql
-  hostname: 10.0.0.1
-  port: 3306
-  username: cdc_user
-  password: "${PASSWORD}"
-  tables: db.\.*                     # ⚠️ 会匹配临时表、备份表
-  server-id: 5500-5504               # 💡 按并行度手动指定范围
-
-sink:
-  type: doris
-  fenodes: 10.0.0.2:8030
-  username: root
-  password: ""
-
-route:
-  - source-table: db.\.*
-    sink-table: ods.ods_<>           # <> 自动替换为源表名
-
-pipeline:
-  name: cdc_pipeline
-  parallelism: 4
-```
-
-**排查清单：**
-
-| 问题 | 原因 | 解决 |
-|------|------|------|
-| server-id 冲突 | YAML 任务与旧的 SQL 任务共享 MySQL 实例 | 先停旧任务，或手动指定范围 |
-| 同步了不该同步的表 | `\.*` 无差别匹配 | 用 `tables.exclude: db.tmp_.*, db._.*_bak` |
-| Schema Evolution 丢数据 | 字段改名映射为先删后加 | 开启但配合监控 |
-| Checkpoint 超时 | 目标库写入慢 | 调大 checkpoint 间隔 |
-| 多表数据倾斜 | 全局并行度下大表占满 | 考虑独立的 YAML 任务拆分 |
+**验证：** 手动模拟乱序写入（先发新值后发旧值），检查目标库是否保留了时间戳最大的那条。
 
 ---
 
-## 五、Debezium 透传属性（debezium.*）深度参考
+#### 原因 3.2：Sequence Column 粒度过粗，同秒内多次变更无法区分
 
-Flink CDC 底层嵌入式 Debezium 引擎的几乎所有行为都通过 `debezium.*` 参数控制。**这是排障中最重要的"暗门"——大部分问题都可以通过透传 Debezium 属性解决。**
+**反向定位：** Sequence Column 用的是秒级时间戳 `DATETIME`，但业务上同一秒内可能发生多次变更。
 
-### 全局通用
-
-| 属性 | 默认值 | 说明 | 排障场景 |
-|------|--------|------|----------|
-| `debezium.snapshot.mode` | `initial` | 快照模式 | 需与 `scan.startup.mode` 配合使用，**不要同时设置两者** |
-| `debezium.snapshot.lock.timeout.ms` | 10000 | 快照锁超时 | 大表快照锁等待超时 |
-| `debezium.snapshot.fetch.size` | 2000 | 快照读取批大小 | 大字段表调大 |
-| `debezium.max.queue.size` | 8192 | 事件队列大小 | 高吞吐场景 OOM 或 backpressure |
-| `debezium.max.batch.size` | 2048 | 批处理大小 | 吞吐调优 |
-| `debezium.poll.interval.ms` | 1000 | 轮询间隔 | 延迟调优 |
-
-### MySQL 专用透传
-
-| 属性 | 默认值 | 说明 | 排障场景 |
-|------|--------|------|----------|
-| `debezium.snapshot.locking.mode` | `minimal` | 快照锁模式 | `none` 可避免锁但可能不一致，`extended` 保证一致性 |
-| `debezium.snapshot.select.statement.overrides` | (none) | 快照 SQL 覆写 | **大数据表只快照需要的数据范围** |
-| `debezium.buffer.max.demand` | 512 | 缓冲区上限 | 高并发写入时避免内存溢出 |
-| `debezium.source.include.query` | false | 是否包含原始 SQL | 调试时开启 |
-| `debezium.event.deserialization.failure.handling.mode` | `warn` | 反序列化失败处理 | `fail` 严格模式，`ignore` 忽略错误事件 |
-
-### PostgreSQL 专用透传
-
-| 属性 | 默认值 | 说明 | 排障场景 |
-|------|--------|------|----------|
-| `debezium.snapshot.select.statement.overrides` | (none) | 快照 SQL 覆写 | 指定 `debezium.snapshot.select.statement.overrides.[schema].[table]` |
-| `debezium.publication.name` | `dbz_publication` | 逻辑发布名称 | 自定义发布名避免冲突 |
-
-### Oracle 专用透传
-
-| 属性 | 默认值 | 说明 | 排障场景 |
-|------|--------|------|----------|
-| `debezium.database.pdb.name` | (none) | CDB 模式下 PDB 名称 | **CDB 模式必须配置** |
-| `debezium.database.history.store.only.monitored.tables.ddl` | false | 只记录监控表的 DDL | 减少历史表大小 |
-| `debezium.log.mining.strategy` | `online_catalog` | LogMiner 策略 | `redo_log_catalog` 可减少内存但更慢 |
-
-### 快照数据范围筛选（PostgreSQL 示例）
-
-```sql
--- 仅快照特定范围的数据（而非全表）
-'debezium.snapshot.select.statement.overrides' = 'public.orders',
-'debezium.snapshot.select.statement.overrides.public.orders' = 
-  'SELECT * FROM public.orders WHERE create_time > ''2025-01-01'''
+**确认方法：**
 ```
+检查目标表的 Sequence Column 定义：
+  如果是 DATETIME 且精度为秒 → 可能存在同秒多次变更覆盖
+  检查源库同一秒内对同一条记录是否有多次 update
+```
+
+**修复：**
+```
+将 Sequence Column 改为毫秒级时间戳或自增版本号。
+Doris 示例：
+  function_column.sequence_type = BIGINT  -- 用自增版本号
+  function_column.sequence_col = update_ms  -- 用毫秒字段
+```
+
+**验证：** 同秒多变更场景下目标库的值正确。
 
 ---
 
-## 六、数据类型映射排查
+## 症状 4：数据值不对——数值字段精度不对
 
-数据类型映射错误是"数据不对"但 CDC 日志正常的常见原因。不同连接器的映射规则不同。
+小数点位错乱、末尾出现多余数字、大数变成负数。
 
-### 常见精度丢失场景
+### 可能原因
 
-| 源类型 | Flink 目标类型 | 问题 | 修复 |
-|--------|---------------|------|------|
-| MySQL DECIMAL(65, s) | DECIMAL(38, s) | **精度被截断** | 精度 > 38 的列映射为 STRING |
-| MySQL BIGINT UNSIGNED | BIGINT | 超出范围变负数 | 映射为 DECIMAL(20, 0) |
-| MySQL TIMESTAMP | TIMESTAMP_LTZ | 时区转换错误 | 设置 `server-time-zone` |
-| Oracle/MySQL JSON | STRING | JSON 格式丢失空格 | `use.legacy.json.format` 控制 |
-| MongoDB 嵌套文档 | ROW / ARRAY<ROW> | 扁平化映射复杂 | 声明完整的嵌套结构 |
-| MySQL ENUM | STRING | 枚举值映射 | 自动转字符串 |
-| MySQL SET | ARRAY<STRING> | 集合映射 | 自动转字符串数组 |
-| Db2 BOOLEAN | BOOLEAN | **CDC 不支持 BOOLEAN 类型** | 用其他类型替代（SQL Replication 限制） |
+#### 原因 4.1：DECIMAL 精度 > 38，Flink 最大只支持 DECIMAL(38, s)
 
-### 时间类型时区陷阱
+**反向定位：** 源表字段类型是 `DECIMAL(65, s)` 或精度超过 38。
+
+**确认方法：**
+
+```sql
+-- 源库检查 decimal 字段的精度
+SELECT COLUMN_NAME, NUMERIC_PRECISION, NUMERIC_SCALE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_NAME = 'your_table'
+  AND DATA_TYPE IN ('decimal', 'numeric')
+  AND NUMERIC_PRECISION > 38;
+```
+
+**修复：**
+```
+在 Flink DDL 中将该字段声明为 STRING 类型来接收完整精度，不做截断。
+'connector' = 'mysql-cdc',
+...
+CREATE TABLE t (
+  amount STRING,     -- 原来是 DECIMAL(65,2)
+  ...
+)
+```
+
+**验证：** 比对源库和目标库的数值字符串是否一致。
+
+---
+
+#### 原因 4.2：BIGINT UNSIGNED 映射为 BIGINT，超出正数范围
+
+**反向定位：** 源表字段是 `BIGINT UNSIGNED`，目标字段是 `BIGINT`（有符号）。
+
+**确认方法：**
+
+```sql
+-- 查找负数值的记录（本应为正数）
+SELECT * FROM target_table WHERE id < 0;
+```
+
+**修复：**
+```
+在 Flink DDL 中将该字段映射为 DECIMAL(20, 0) 来容纳无符号范围。
+```
+
+**验证：** 修复后检查原来为负数的记录是否变为正数。
+
+---
+
+## 症状 5：数据值不对——时间字段差了几个小时
+
+目标库的时间字段整体偏移了固定的小时数，或者只有边界时间出错。
+
+### 可能原因
+
+#### 原因 5.1：源库时区和目标库时区不一致，TIMESTAMP 转换错误
+
+**反向定位：** 时间偏差是否是固定的整数小时（如差 8 小时、13 小时）。
+
+**确认方法：**
+
+```sql
+-- 检查 MySQL 的时区设置
+SHOW VARIABLES LIKE 'time_zone';
+-- 可能输出：SYSTEM、+08:00、America/Chicago 等
+
+-- 检查 Flink DDL 中的 server-time-zone 配置
+-- 'server-time-zone' = 'Asia/Shanghai'
+-- 如果不设置，默认用 ZoneId.systemDefault()
+```
+
+**修复：**
+```
+在 Flink DDL 中明确设置 server-time-zone：
+  'server-time-zone' = 'Asia/Shanghai'
+值应与数据库的时区一致，而非业务期望的时区。
+```
+
+**验证：** 修改后对比源库和目标库同一条记录的时间戳。
+
+---
+
+#### 原因 5.2：业务代码写入的时间与数据库时间戳混用
+
+**反向定位：** 同一条记录中有的时间戳是业务代码写入的（如 `order_time`），有的是数据库自动生成的（如 `modified_time`），两者时区不同。
+
+**确认方法：**
+```sql
+-- 对比两条记录的时间差是否等于时区差值
+SELECT 
+  order_time,
+  modified_time,
+  TIMESTAMPDIFF(HOUR, order_time, modified_time) AS hour_diff
+FROM source_table
+LIMIT 10;
+```
+
+如果 `hour_diff` 在一天内的不同时段数值不同，说明时区链有问题。
+
+**修复：**
+```
+确保增量切分用数据库自动维护的 modified_time，不用业务写入的时间戳。
+如必须用业务时间戳，在 Flink ETL 中显式转换时区：CONVERT_TZ(...)
+```
+
+**验证：** 同一条记录的多个时间戳之间的逻辑关系正确。
+
+---
+
+## 症状 6：任务启动就报错
+
+任务提交后立即失败，无法启动。
+
+### 可能原因
+
+#### 原因 6.1：binlog / WAL / 归档日志未开启
+
+**反向定位：** 数据库层面未开启变更捕获所需的日志。
+
+**确认方法：**
+
+| 数据库 | 检查命令 | 期望值 |
+|--------|----------|--------|
+| MySQL | `SHOW VARIABLES LIKE 'log_bin'` | `ON` |
+| MySQL | `SHOW VARIABLES LIKE 'binlog_format'` | `ROW` |
+| Oracle | `archive log list` | `Archive Mode` |
+| PostgreSQL | `SHOW wal_level;` | `logical` |
+| MongoDB | `db.version()` + 检查副本集 | ≥ 3.6 + 副本集/分片集群 |
+
+**修复：** 参考各数据库官方文档开启相应日志模式。
+
+**验证：** 再次提交任务，启动成功。
+
+---
+
+#### 原因 6.2：CDC 账号权限不足
+
+**反向定位：** 报错信息中包含 `Access denied`、`Permission denied`、`REPLICATION` 等关键词。
+
+**确认方法：**
 
 ```sql
 -- MySQL
-'server-time-zone' = 'Asia/Shanghai'  -- 控制 TIMESTAMP 类型如何转 STRING
+SHOW GRANTS FOR 'cdc_user'@'%';
+-- 必须包含：SELECT, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT
 
--- 暴露 op_ts 元数据获取数据库层面的变更时间
-op_ts TIMESTAMP_LTZ(3) METADATA FROM 'op_ts' VIRTUAL
+-- PostgreSQL：检查角色
+\du
 ```
 
-### Decimal 精度完整映射
+**修复：** 授予 CDC 所需的最小权限。
 
-| 源精度 | Flink 映射 | 建议 |
-|--------|-----------|------|
-| p ≤ 38 | `DECIMAL(p, s)` | 直接映射 |
-| p > 38 | `STRING` | **必须先转 STRING 再处理** |
+**验证：** 用 CDC 账号手动尝试连接和读取变更日志。
 
 ---
 
-## 七、性能调优指南
+#### 原因 6.3：server-id 与已有客户端冲突（MySQL / OceanBase）
 
-### 并行度与 server-id
+**反向定位：** 同一 MySQL 实例上已有其他 CDC 任务在运行，server-id 重复。报错可能包含 `slave id`、`conflict` 等。
 
-```yaml
-# 并行度原则：每个并行 reader 需要一个唯一 server-id
-# server-id 范围 ≥ 并行度
-'server-id' = '5401-5408'   # 并行度 8
-SET 'parallelism.default' = 8;
+**确认方法：**
+
+```sql
+SHOW PROCESSLIST;
+-- 查看每个连接的 server-id
 ```
 
-### Chunk 大小调优
-
-```yaml
-# 大表（> 1亿行）：chunk.size 调大
-'scan.incremental.snapshot.chunk.size' = '65536'
-
-# 小表（< 100万行）：chunk.size 调小
-'scan.incremental.snapshot.chunk.size' = '2048'
+**修复：**
+```
+在 Flink DDL 中手动指定 server-id 范围：
+  'server-id' = '5401-54xx'   -- xx ≥ 并行度
+确保范围与同一 MySQL 实例上所有其他 CDC 任务不重叠。
 ```
 
-### Checkpoint 配置
-
-```yaml
-# 实时场景（低延迟优先）
-SET 'execution.checkpointing.interval' = '10s';
-SET 'execution.checkpointing.timeout' = '1min';
-
-# 大表快照场景（避免 failover）
-SET 'execution.checkpointing.interval' = '10min';
-SET 'execution.checkpointing.tolerable-failed-checkpoints' = '100';
-```
-
-### 数据分布均匀性调优
-
-当 chunk key 分布不均匀时（例如自增 ID 大量跳号），可通过分布因子参数优化分片：
-
-```yaml
-# 分布因子 = (MAX(id) - MIN(id) + 1) / rowCount
-# 值越接近 1 说明分布越均匀
-# 值远大于 1 说明数据稀疏，需要用查询方式分片
-
-'chunk-key.even-distribution.factor.lower-bound' = '0.05'
-'chunk-key.even-distribution.factor.upper-bound' = '1000.0'
-```
+**验证：** 任务启动成功，不再报 server-id 冲突。
 
 ---
 
-## 八、Flink 监控指标
+#### 原因 6.4：连接器 JAR 版本与 Flink 版本不匹配
 
-CDC Source 内置了 Flink Metrics，用于监控快照和增量阶段的进度：
+**反向定位：** 报错包含 `ClassNotFoundException`、`NoSuchMethodError`、`Incompatible` 等。
 
-| 指标 | 类型 | 说明 |
-|------|------|------|
-| `isSnapshotting` | Gauge | 当前是否在快照阶段 |
-| `isStreamReading` | Gauge | 当前是否在增量阶段 |
-| `numTablesSnapshotted` | Gauge | 已完成快照的表数量 |
-| `numTablesRemaining` | Gauge | 尚未快照的表数量 |
-| `numSnapshotSplitsProcessed` | Gauge | 正在处理的分片数 |
-| `numSnapshotSplitsRemaining` | Gauge | 剩余分片数 |
-| `numSnapshotSplitsFinished` | Gauge | 已完成的分片数 |
-| `snapshotStartTime` | Gauge | 快照开始时间 |
-| `snapshotEndTime` | Gauge | 快照结束时间 |
-
-**指标名格式：** `{database}.{schema}.{table}.{metric_name}`  
-例如 MySQL：`mydb.inventory.products.isSnapshotting`  
-例如 Db2：`test_database.test_schema.test_table.numSnapshotSplitsFinished`
-
-**典型运维场景：**
+**确认方法：**
 ```
-# 快照卡住了？查看 numSnapshotSplitsRemaining
-# 大表分片过多？检查 numSnapshotSplitsFinished 增长曲线
-# 确认当前阶段：isSnapshotting = true → 快照中；isStreamReading = true → 增量中
+检查 Flink CDC JAR 版本和 Flink 版本的映射关系（参考技能前置条件章节的版本表）。
+例如：flink-sql-connector-mysql-cdc 3.0.x 需要 Flink 1.14+。
 ```
+
+**修复：** 下载与当前 Flink 版本兼容的 CDC JAR。
+
+**验证：** 启动成功。
 
 ---
 
-## 九、高可用与故障恢复
+#### 原因 6.5：Oracle LogMiner 未配置归档或补充日志
 
-### MySQL GTID 高可用
+**反向定位：** 错误信息涉及 `LOGMINER`、`archivelog`、`supplemental log`。
 
+**确认方法：**
+```sql
+-- 检查归档模式
+archive log list;
+
+-- 检查补充日志
+SELECT supplemental_log_data_min FROM v$database;
+```
+
+**修复：**
+```sql
+ALTER DATABASE ARCHIVELOG;
+ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;
+-- CDB 模式还需：
+'debezium.database.pdb.name' = 'your_pdb_name'
+```
+
+**验证：** 启动成功。
+
+---
+
+#### 原因 6.6：PostgreSQL 复制槽被占用
+
+**反向定位：** 报错 `replication slot "flink" is active for PID xxxx`。
+
+**确认方法：**
+```sql
+SELECT slot_name, active, pid FROM pg_replication_slots;
+-- 如果 slot_name 已存在且 active = true，说明被其他进程占用
+```
+
+**修复：**
+```
+方案一：用不同的 slot.name 启动新任务
+方案二：等旧进程释放（KILL 旧 PID），再用原 slot name
+方案三：DROP 旧槽重建
+```
+
+**验证：** 启动成功。
+
+---
+
+## 症状 7：任务运行中突然断开，周期性断开
+
+任务能启动，但运行一段时间后自动断开连接，然后重试。
+
+### 可能原因
+
+#### 原因 7.1：MySQL 连接超时参数过短
+
+**反向定位：** 断开发生在前一个事件处理后一段时间（接近 `wait_timeout` 值），然后自动重连。
+
+**确认方法：**
+```sql
+SHOW VARIABLES LIKE 'wait_timeout';
+SHOW VARIABLES LIKE 'interactive_timeout';
+-- 默认通常是 28800（8 小时），如果被改为较小值（如 300）则容易超时
+```
+
+**修复：**
 ```ini
-# MySQL 集群配置
+# my.cnf
+wait_timeout = 86400
+interactive_timeout = 86400
+```
+
+**验证：** 修改后观察是否仍出现周期性断开。
+
+---
+
+#### 原因 7.2：网络层不稳定（跨机房、SSL、防火墙）
+
+**反向定位：** 断开的间隔不固定，伴随网络延迟抖动。
+
+**确认方法：**
+```
+检查源库和目标库的网络延迟和丢包率。
+如果启用 SSL，检查 SSL 证书是否有效、是否到期。
+```
+
+**修复：**
+```
+在 JDBC 连接中配置 keepalive 和重试参数：
+  'connect.timeout' = '30s',
+  'connect.max-retries' = '3'
+如果跨机房，考虑缩短心跳间隔以保持连接活跃。
+```
+
+**验证：** 观察一段时间内是否不再断开。
+
+---
+
+#### 原因 7.3：MySQL 心跳间隔太长，慢变更表导致 binlog 位置被清理
+
+**反向定位：** 表长时间没有写入，断开恢复后报 binlog 位置不存在。
+
+**确认方法：**
+```sql
+-- 检查 binlog 保留时长
+SHOW VARIABLES LIKE 'binlog_expire_logs_seconds';
+-- 默认 2592000（30 天），但若磁盘紧张可能被缩短
+```
+
+**修复：**
+```
+确保心跳开启（默认 30s）：
+  'heartbeat.interval' = '30s'
+不要禁用：'heartbeat.interval' = '0s' ❌
+```
+
+**验证：** 慢变更表场景下长时间运行不再断开。
+
+---
+
+## 症状 8：从 checkpoint/savepoint 恢复失败
+
+任务停止后重新从 checkpoint 恢复，报错或数据对不上。
+
+### 可能原因
+
+#### 原因 8.1：binlog / WAL / 归档日志已被清理，恢复位点不存在
+
+**反向定位：** 恢复报错中包含 `binlog` 文件找不到、`GTID` 不存在、`SCN` 过期、`resumeToken` 不存在。
+
+**确认方法：**
+```sql
+-- MySQL：检查 checkpoint 记录的 binlog 文件是否还存在
+SHOW BINARY LOGS;
+-- 把 checkpoint 记录的 binlog 文件名与此列表对比
+
+-- 如果 binlog 已被清理 → 需要重新 initial 全量快照
+```
+
+**修复：**
+```
+方案一（快速恢复，可能丢数据）：用 latest-offset 模式从当前最新位点开始
+方案二（完整恢复但慢）：用 initial 模式重新做全量+增量
+方案三（精确恢复）：如果能定位到可用的历史位点，用 specific-offset 指定
+```
+
+**验证：** 恢复后数据一致性检查。
+
+---
+
+#### 原因 8.2：MongoDB resumeToken 过期
+
+**反向定位：** 恢复报错包含 `resumeToken`、`token`、`expired`。
+
+**确认方法：** 检查集合的变更频率和心跳配置。
+
+**修复：**
+```
+设置较短的 heartbeat 间隔，持续推送 resumeToken：
+  'heartbeat.interval.ms' = '300000'  （建议 5 分钟）
+慢变更集合强烈建议设置。
+```
+
+**验证：** 从 savepoint 恢复成功。
+
+---
+
+#### 原因 8.3：PostgreSQL 复制槽的 LSN 已经被提交
+
+**反向定位：** 恢复后部分数据缺失。
+
+**确认方法：**
+```
+检查 scan.lsn-commit.checkpoints-num-delay 配置（默认 3）。
+如果有多次 checkpoint 提交，最初的 LSN 可能已被提交，旧位点不可恢复。
+```
+
+**修复：**
+```
+增大 checkpoints-num-delay 值，延迟 LSN 提交时间：
+  'scan.lsn-commit.checkpoints-num-delay' = '10'
+```
+
+**验证：** 从较早的 checkpoint 恢复成功。
+
+---
+
+## 症状 9：同步延迟越来越高（反压）
+
+CDC 管道刚开始正常，运行一段时间后延迟持续增大，差距无法追上。
+
+### 可能原因
+
+#### 原因 9.1：目标库写入能力跟不上源库变更速度
+
+**反向定位：** 源库变更速率恒定，但目标库的写入时延持续增长。Flink WebUI 中出现 `backpressure`。
+
+**确认方法：**
+```
+Flink WebUI → 查看算子背压状态。
+如果 Source 端正常但 Sink 端出现 HIGH backpressure → 目标库写入慢。
+```
+
+**修复：**
+```
+方案一：增加 Flink 并行度
+  SET 'parallelism.default' = '8';
+  注意需同步扩大 server-id 范围
+  
+方案二：增大 checkpoint 间隔，减少写入冲突
+  SET 'execution.checkpointing.interval' = '30s';
+  
+方案三：检查目标库的写入瓶颈（磁盘 IO、compaction、导入队列）
+```
+
+**验证：** 延迟曲线下降并稳定。
+
+---
+
+#### 原因 9.2：debezium.max.queue.size 太小，事件排队
+
+**反向定位：** Source 端正常，但事件处理端有明显的排队积压。
+
+**确认方法：**
+```
+检查 Debezium 队列相关配置：
+  debezium.max.queue.size（默认 8192）
+  debezium.max.batch.size（默认 2048）
+如果源库批量更新频繁，队列可能溢出。
+```
+
+**修复：**
+```yaml
+'debezium.max.queue.size' = '16384'
+'debezium.max.batch.size' = '4096'
+```
+
+**验证：** 延迟下降。
+
+---
+
+#### 原因 9.3：大表快照阶段尚未完成，增量 binlog 排队
+
+**反向定位：** 任务刚刚启动，正处于快照读阶段。
+
+**确认方法：**
+```
+查看 Flink Metrics：isSnapshotting = true → 还在快照阶段
+快照阶段不消费 binlog，binlog 在位点上堆积，快照完成后会追上。
+```
+
+**修复：**
+```
+这是正常行为。如果快照太慢影响业务，调整 chunk.size：
+  'scan.incremental.snapshot.chunk.size' = '65536'   （默认 8096，大表调大）
+```
+
+**验证：** 快照完成后延迟自动追上。
+
+---
+
+## 症状 10：OOM / 内存溢出
+
+任务运行中或快照阶段报 `OutOfMemoryError`。
+
+### 可能原因
+
+#### 原因 10.1：大表快照时最大分片过大，内存不足
+
+**反向定位：** OOM 发生在快照阶段的最后一个分片（unbounded chunk）。
+
+**确认方法：**
+```
+检查 Flink TaskManager 的内存配置和表的最大分片大小。
+```
+
+**修复：**
+```yaml
+# 开启先分配 unbounded chunk，降低 OOM 风险（默认 true）
+'scan.incremental.snapshot.unbounded-chunk-first.enabled' = 'true'
+
+# 增大 TaskManager 内存
+taskmanager.memory.process.size: 4g
+```
+
+**验证：** 快照阶段不再 OOM。
+
+---
+
+#### 原因 10.2：debezium.max.queue.size 过大，事件队列占满内存
+
+**反向定位：** 高吞吐场景下队列积压。
+
+**修复：**
+```yaml
+'debezium.max.queue.size' = '8192'    # 默认值，不需要调太大
+'debezium.buffer.max.demand' = '512'  # 控制缓冲区上限
+```
+
+**验证：** 内存使用稳定。
+
+---
+
+#### 原因 10.3：Oracle LogMiner 使用 online_catalog 策略内存消耗大
+
+**修复：**
+```yaml
+# 改用 redo_log_catalog 策略，减少内存但更慢
+'debezium.log.mining.strategy' = 'redo_log_catalog'
+```
+
+**验证：** OOM 消失。
+
+---
+
+## 症状 11：源表结构变更后同步异常
+
+### 11a：源表加了字段，目标库没有
+
+**反向定位：** 确认 Schema Evolution 是否开启。
+
+**确认方法：**
+```sql
+-- 检查 Flink DDL 中有无配置 schema change
+-- MySQL CDC: 默认不开启
+-- CDC YAML: schema-change.enabled 默认 false
+```
+
+**修复：**
+```
+MySQL CDC SQL 模式不支持自动 DDL 同步。
+方案一：手动修改 Flink DDL，从 savepoint 重启
+方案二：CDC YAML 模式开启 schema-change.enabled
+```
+
+---
+
+### 11b：源表改了字段类型，写入失败
+
+**反向定位：** 报错包含 `Type mismatch`、`cannot be cast`、`truncation`。
+
+**确认方法：**
+```
+对比源表新的字段类型和 Flink DDL 中的字段类型是否兼容。
+```
+
+**修复：**
+```
+方案一：类型缩窄（如 INT→TINYINT）→ 改 Flink DDL 后重启
+方案二：字符串长度变短（VARCHAR(200)→VARCHAR(100)）→ 可能丢数据，需评估
+方案三：字段改名 → 映射为先删后加，数据丢失，避免自动同步
+```
+
+---
+
+### 11c：MySQL gh-ost / pt-osc 在线 DDL 导致同步异常
+
+**反向定位：** 表结构变更后有大量重复或丢失数据。
+
+**修复：**
+```yaml
+# 开启在线 DDL 解析（实验性）
+'scan.parse.online.schema.changes.enabled' = 'true'
+```
+
+---
+
+## 症状 12：数据库主从切换后 CDC 异常
+
+源库发生了主从切换（failover）后，CDC 任务数据对不上了。
+
+### 可能原因
+
+#### 原因 12.1：MySQL GTID 未开启，从库的 binlog 位点与主库不一致
+
+**反向定位：** 主从切换后 CDC 仍然追踪旧的 binlog 文件名+位置，但新主库上这些信息不存在。
+
+**确认方法：**
+```sql
+SHOW VARIABLES LIKE 'gtid_mode';
+-- 如果是 OFF → 主从切换后位点必然失效
+```
+
+**修复：**
+```ini
+# MySQL 集群必须开启 GTID
 gtid_mode = on
 enforce_gtid_consistency = on
-log-slave-updates = 1    # 监控从实例时需要
+# 如果从 CDC 读从库，还需
+log-slave-updates = 1
 ```
 
-**故障切换策略：**
-| 策略 | 做法 | 优点 |
-|------|------|------|
-| DNS/VIP | CDC 连接 DNS 名，故障时 DNS 切换 | 无需改配置，零中断 |
-| 修改 hostname | savepoint → 改 hostname → 恢复 | 手动可控 |
-
-### 恢复策略矩阵
-
-| 故障场景 | 恢复操作 | 注意事项 |
-|----------|----------|----------|
-| 任务意外停止 | 从最新 checkpoint/savepoint 恢复 | Exactly-Once 保障 |
-| binlog 已被清理 | 用 `initial` 重新快照 | 大表需要长时间窗口 |
-| binlog 部分可用 | 用 `specific-offset` 从已知位点恢复 | 需确认位点仍然存在 |
-| 数据发现不一致 | 定位不一致范围 → 用 flink 从问题前的位点重放 | ⚠️ 需回滚下游数据 |
-| Oracle SCN 过期 | 检查归档日志保留策略 | 延长归档保留时间 |
-| PG 复制槽损坏 | 删槽重建 | 可能会导致短暂数据丢失 |
-| MongoDB resumeToken 过期 | 设置 `heartbeat.interval.ms` | 从 savepoint 恢复 |
+**验证：** 主从切换后 CDC 自动从新主库的正确位点继续消费。
 
 ---
 
-## 十、验证标准
+#### 原因 12.2：PostgreSQL 主从切换后复制槽丢失
 
-| 验证项 | 通过标准 | 检查方法 |
-|--------|----------|----------|
-| 数据量对账 | 主键差 < 0.1% | `COUNT(*)` 对比 + 差集 `EXCEPT` |
-| 快照进度 | `numSnapshotSplitsRemaining = 0` | Flink Metrics |
-| 乱序修复 | 目标库最新值 = 源库最新值 | 逐条对比关键变更 |
-| 整库完整性 | 无遗漏表、无多余表 | `tables.exclude` 确认 |
-| 延迟 | 端到端 < 30s（实时场景） | Flink 延迟 Metrics |
-| 心跳 | 心跳间隔内 binlog 位置更新 | `SHOW PROCESSLIST` 或 Metrics |
-| 复制槽 | slot 活跃且 WAL 不膨胀 | `pg_replication_slots` 检查 |
-| Checkpoint | checkpoint 成功率 > 99% | Flink WebUI / Metrics |
+**反向定位：** 切换后报复制槽找不到。
+
+**修复：**
+```
+PostgreSQL CDC 在流复制切换后，逻辑复制槽只存在于原主库。
+需要在新主库上创建新复制槽，重新开始 CDC。
+建议为 PostgreSQL 配置连接池或 VIP，让 CDC 自动重连到新主。
+```
 
 ---
 
-## 十一、错误信息速查
+## 附录：快速诊断命令集
 
-| 错误模式 | 常见根因 | 排查方向 |
-|----------|----------|----------|
-| `Table xxx is not supported by the connector` | 表无主键（MySQL/Oracle/PG/SQLServer） | 添加主键或用 Db2 3.4.0+ 的 chunk key 方案 |
-| `Server id is not unique` | 多个 CDC 任务 server-id 冲突 | 用范围分配 `5401-54xx` |
-| `Replication slot is active for PID` | PG 复制槽被其他进程占用 | 换 slot.name 或等旧进程释放 |
-| `ResumeToken not found` | MongoDB resumeToken 过期 | 设置 heartbeat.interval.ms |
-| `No stable position found` | binlog/归档日志已被清理 | 调长保留时间或重新 initial |
-| `Column 'xxx' of type 'BOOLEAN' is not supported` | Db2 BOOLEAN 不支持 CDC | 换用 SMALLINT |
-| `Decimal precision 65 exceeds max 38` | 精度 > 38 的 DECIMAL | 映射为 STRING |
-| `Cannot perform checkpoint during scanning snapshot` | Oracle/SQLServer 快照阶段无法 checkpoint | 配置 toleratble-failed-checkpoints |
-| `Schema change cannot be applied` | DDL 不被目标库支持 | 关闭 schema evolution 或手动处理 |
-| `Chunk key column updated` | 分片键列在快照期间被更新 | 用主键列做 chunk key |
+以下命令可用于排查大多数场景：
 
----
+```sql
+-- MySQL 全局检查
+SHOW VARIABLES LIKE 'log_bin';
+SHOW VARIABLES LIKE 'binlog_format';
+SHOW VARIABLES LIKE 'gtid_mode';
+SHOW VARIABLES LIKE 'binlog_expire_logs_seconds';
+SHOW VARIABLES LIKE 'server_id';
+SHOW VARIABLES LIKE 'wait_timeout';
+SHOW BINARY LOGS;
 
-## 十二、示例（Examples）
+-- PostgreSQL 复制槽检查
+SELECT slot_name, slot_type, database, wal_status, active 
+FROM pg_replication_slots;
 
-### 示例 1：增量数据对不上
+-- Oracle 归档检查
+archive log list;
+SELECT supplemental_log_data_min FROM v$database;
 
-**用户：** 业务库 10000 单，数仓只有 7000 单。
-**排查：** 按小时对账 → 凌晨数据缺失 → 源库 UTC-5，数仓 UTC+8 → 窗口加 1h 缓冲。
+-- Flink 指标检查（WebUI / REST API）
+-- GET /jobs/:jobid/metrics?get=0.isSnapshotting,0.numSnapshotSplitsRemaining
+```
 
-### 示例 2：CDC 乱序
+## 附录：修复验证清单
 
-**用户：** 订单状态"已支付→已发货→已完成"后，目标库还是"已支付"。
-**排查：** CDC ✅ → Flink ✅ → 目标库导入日志显示已完成先到、已支付后到 → 启用 Sequence Column。
+修复完成后，按以下顺序验证：
 
-### 示例 3：任务启动失败——binlog 未开
-
-**用户：** Flink CDC MySQL 任务启动就报错。
-**排查：** `log_bin=OFF` → 开启 `log_bin=ON`, `binlog_format=ROW` → 配置 CDC 用户权限。
-
-### 示例 4：MongoDB 检查点恢复失败
-
-**用户：** 任务停后恢复，报 resumeToken 过期。
-**排查：** 慢变更集合未设心跳 → 设置 `heartbeat.interval.ms = 300000` → 从 savepoint 恢复成功。
-
-### 示例 5：PostgreSQL 复制槽导致 WAL 膨胀
-
-**用户：** CDC 任务停了几天，PostgreSQL 磁盘报警 95%。
-**排查：** 查看 `pg_replication_slots` → 复制槽未释放 → WAL 堆积 → 删除无用槽后清理 WAL → 设置定时监控。
-
-### 示例 6：Decimal 精度丢失
-
-**用户：** 金额字段同步后小数点后多出乱码。
-**排查：** MySQL DECIMAL(65,2) 映射为 Flink DECIMAL(38,2) → 精度截断 → 改为 STRING 映射 → 数据正确。
+1. **任务状态**：Flink WebUI → Job 状态 → RUNNING
+2. **Checkpoint**：最近几个 checkpoint 全部成功
+3. **数据量**：源库和目标库主键差 < 0.1%
+4. **数据值**：任取 10 条记录逐字段对比
+5. **延迟**：端到端延迟在业务容忍范围内
+6. **稳定性**：观察 30 分钟无异常断开
 
 ---
 
-## 十三、参考文档
+## 参考文档
 
-- `references/cdc-cases.md` — 生产环境 CDC 排障案例集（按需加载）
 - Apache Flink CDC 官方文档：https://nightlies.apache.org/flink/flink-cdc-docs-stable/
 - Debezium 文档：https://debezium.io/documentation/reference/stable/
 - Doris Sequence Column：https://doris.apache.org/docs/dev/data-operate/update/unique-update-concurrent-control/
-- Paimon CDC 配置：https://paimon.apache.org/docs/master/engines/flink/
-- Flink Metrics：https://nightlies.apache.org/flink/flink-docs-stable/docs/ops/metrics/
