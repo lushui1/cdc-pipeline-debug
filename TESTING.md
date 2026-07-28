@@ -2,122 +2,91 @@
 
 ## 测试准备
 
-你需要一个支持 Skill 的 Agent 客户端。当前支持的有：
+你需要一个支持 Skill 的 Agent 客户端：
 
 | 客户端 | 安装方式 |
 |--------|----------|
-| **Qwen Code (Qoder CLI)** | 国内推荐，无需代理，完全兼容 SKILL 标准 |
-| Claude Code | 需要 Anthropic 账号和 API Key |
-| Cursor | Settings → General → Skills 目录 |
-| Windsurf | 配置目录下放置 SKILL.md |
+| **Hermes** | 推荐，原生支持 |
+| Qwen Code (Qoder CLI) | 国内可用 |
+| Claude Code | 需 Anthropic API Key |
+| Cursor | 设置 → Skills 目录 |
 
-**推荐先用 Qwen Code**：`pip install qoder-cli` 或直接下载二进制，无需翻墙。
+## 安装 Skill
 
-## 测试步骤
-
-### 1. 加载 Skill
-
-把 `cdc-pipeline-debug` 文件夹放到客户端的技能目录：
-
-**Qwen Code：**
 ```bash
-# 全局生效
-cp -r cdc-pipeline-debug ~/.qode/skills/
-
-# 或项目级生效
-cp -r cdc-pipeline-debug .qode/skills/
+hermes skills install \
+  https://raw.githubusercontent.com/lushui1/cdc-pipeline-debug/main/SKILL.md \
+  --name cdc-pipeline-debug
 ```
 
-**Claude Code：**
+确认安装成功：
+
 ```bash
-cp -r cdc-pipeline-debug ~/.claude/skills/
+hermes skills list | grep cdc-pipeline-debug
 ```
 
-**Cursor：**
-```bash
-cp -r cdc-pipeline-debug ~/.cursor/skills/
+## 测试用例
+
+共 **14 个测试用例**，覆盖 8 大分类 + 负例：
+
+| # | 文件 | 分类 | 测试内容 | 应触发 |
+|---|------|------|----------|--------|
+| 1 | `tests/001-data-count-mismatch.md` | 一、数据问题 | 凌晨边界数据缺失 | ✅ |
+| 2 | `tests/002-data-value-rollback.md` | 一、数据问题 | CDC 日志正常但数据回退 | ✅ |
+| 3 | `tests/003-task-startup-error.md` | 二、任务问题 | 任务启动就报错 | ✅ |
+| 4 | `tests/004-performance-lag.md` | 三、性能问题 | 延迟越来越高 | ✅ |
+| 5 | `tests/005-ddl-schema-change.md` | 四、结构问题 | 加字段未同步到目标库 | ✅ |
+| 6 | `tests/006-upgrade-migration.md` | 五、运维问题 | MySQL 升级后 CDC 异常 | ✅ |
+| 7 | `tests/007-first-time-setup.md` | 六、配置搭建 | 第一次搭建不会配 | ✅ |
+| 8 | `tests/008-monitoring-alerting.md` | 七、预防优化 | 怎么监控和告警 | ✅ |
+| 9 | `tests/009-canal-tool-issue.md` | 八、其他工具 | Canal 连不上 MySQL | ✅ |
+| 10 | `tests/010-debezium-pg-issue.md` | 八、其他工具 | Debezium 连不上 PG | ✅ |
+| 11 | `tests/011-recovery-failure.md` | 二、任务问题 | checkpoint 恢复 binlog 找不到 | ✅ |
+| 12 | `tests/012-failover-issue.md` | 五、运维问题 | 主从切换后数据不对 | ✅ |
+| 13 | `tests/013-negative-react.md` | 负例 | React Hook 问题 | ❌ |
+| 14 | `tests/014-negative-css.md` | 负例 | CSS 兼容性问题 | ❌ |
+
+## 测试方法
+
+### 定性测试
+
+在 Agent 客户端的对话中直接输入每条 prompt，记录：
+
+```
+case-001:
+  触发: ✅/❌
+  回答质量: 正确/部分正确/错误
+  备注: _______
 ```
 
-### 2. 运行测试
+### 定量测试（可选）
 
-打开客户端，依次输入 `tests/` 目录下的每条 prompt。
+每条正例跑 10 次，统计触发率：
 
-| 用例 | prompt 位置 | 预期 | 触发 |
-|------|-------------|------|------|
-| case-01 | `tests/case-01-trigger-happy-path.md` | 增量对账排查 | ✅ 应触发 |
-| case-02 | `tests/case-02-trigger-cdc-out-of-sync.md` | 乱序 + Sequence Column | ✅ 应触发 |
-| case-03 | `tests/case-03-trigger-delete-not-captured.md` | 物理删除方案 | ✅ 应触发 |
-| case-04 | `tests/case-04-trigger-whole-db-sync.md` | YAML 整库同步 | ✅ 应触发 |
-| case-05 | `tests/case-05-trigger-edge-vague.md` | 模糊输入也能引导 | ✅ 应触发 |
-| case-06 | `tests/case-06-negative-not-cdc.md` | 不应使用本技能 | ❌ 不应触发 |
-| case-07 | `tests/case-07-negative-frontend.md` | 不应使用本技能 | ❌ 不应触发 |
+| 指标 | 达标线 |
+|------|--------|
+| 触发率（正例） | ≥ 80% |
+| 不触发率（负例） | 100% |
+| 回答正确率 | ≥ 80% |
 
-### 3. 记录结果
-
-每跑一条 prompt 记录：
-
-```
-case-01:
-  trigger: ✅/❌  （Agent 是否加载了本技能？）
-  output_pass: ✅/❌  （输出是否符合 expected？）
-  备注: ...
-```
-
-### 4. 评估标准
-
-按 anolis-skill-creator 规范：
-
-| 指标 | 标准 | 不达标怎么办 |
-|------|------|-------------|
-| **触发率** | ≥ 80% | 改 description，加更多触发短语，语气更 pushy |
-| **正确率** | ≥ 80% | 改 body，步骤拆更细，补 pitfalls 和 examples |
-
-**触发率计算：**
-```
-触发率 = 应该触发的 case 中实际触发数 ÷ 应该触发的 case 总数 × 100%
-不应触发的 case 不算在内。
-```
-
-**正确率计算：**
-```
-正确率 = 触发且输出符合预期的 case 数 ÷ 实际触发的 case 总数 × 100%
-```
-
-### 5. 迭代
+### 不达标怎么办
 
 | 问题 | 改哪 |
 |------|------|
-| 触发率 < 80% | `description` 加触发短语、强化 pushy 语气 |
-| 正确率 < 80% | `body` 步骤拆更细、补 pitfalls、补 examples |
-| 触发但结果不对 | 检查具体哪个步骤没被执行，补指令 |
+| 触发率 < 80% | 改 `description`，加触发短语，强化 pushy 语气 |
+| 回答正确率 < 80% | 改 body 步骤，补场景细节，补示例 |
+| 负例误触发 | 检查 description 是否过于宽泛 |
 
-### 定量测试（进阶）
+## 打分标准
 
-要测准触发率，每条 prompt 至少跑 10 次（去掉最极端的一次）：
+参考 anolis-skill-creator 发布前自检清单：
 
-```bash
-# 示例：用 Qwen Code 批量测试
-for i in {1..10}; do
-  qode run "$(cat tests/case-01-trigger-happy-path.md | grep '^> ' | sed 's/^> //')"
-  sleep 2
-done
-```
-
-方差大就加到 30 次。
-
----
-
-## 打包与发布
-
-测试达标后（触发率 ≥ 80%、正确率 ≥ 80%），打包发布：
-
-```bash
-cd D:/Desktop/python_ETL_fork
-zip -r cdc-pipeline-debug.zip cdc-pipeline-debug/
-
-# 检查 ZIP 结构正确（必须有顶层目录）
-unzip -l cdc-pipeline-debug.zip | head -5
-# 应输出：cdc-pipeline-debug/SKILL.md  （不是 SKILL.md 直接平铺）
-```
-
-然后去 https://skillhub.openanolis.cn 上传，或提交 Gitee PR。
+- [ ] name 三处一致（ZIP/目录/frontmatter）
+- [ ] description 含"做什么 + 什么时候触发"
+- [ ] description 至少 3 个触发短语
+- [ ] body ≥ 5 行 + ≥ 1 个 `##` 章节
+- [ ] ≥ 1 个完整示例
+- [ ] 跑过 ≥ 5 条测试 prompt
+- [ ] 触发率 ≥ 80%、正确率 ≥ 80%
+- [ ] ZIP 内无 `.DS_Store` / `__MACOSX/`
+- [ ] 至少一个客户端实测导入成功
